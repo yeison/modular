@@ -11,18 +11,14 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import List
 from collections.string import StaticString
 
 import ._c
-import ._c.BuiltinAttributes
-import ._c.BuiltinTypes
-from ._c.ffi import MLIR_func
 from .ir import Attribute, Context, DialectAttribute, Type
 
 
-@value
-struct BoolAttr(DialectAttribute):
+@fieldwise_init
+struct BoolAttr(Copyable, DialectAttribute, Movable):
     var ctx: Context
     var value: Bool
 
@@ -39,8 +35,7 @@ struct BoolAttr(DialectAttribute):
         )
 
 
-@value
-struct TypeAttr(DialectAttribute):
+struct TypeAttr(Copyable, DialectAttribute, Movable):
     var type: Type
 
     @implicit
@@ -57,8 +52,8 @@ struct TypeAttr(DialectAttribute):
         return Self(_c.BuiltinAttributes.mlirTypeAttrGetValue(attr.c))
 
 
-@value
-struct StringAttr(DialectAttribute):
+@fieldwise_init
+struct StringAttr(Copyable, DialectAttribute, Movable):
     var ctx: Context
     var value: String
 

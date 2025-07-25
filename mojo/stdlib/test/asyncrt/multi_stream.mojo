@@ -14,19 +14,18 @@
 from asyncrt_test_utils import create_test_device_context, expect_eq
 from gpu import *
 from gpu.host import DeviceContext
-from memory import UnsafePointer
 
 
 fn vec_func(
     in0: UnsafePointer[Float32],
     in1: UnsafePointer[Float32],
-    out: UnsafePointer[Float32],
+    output: UnsafePointer[Float32],
     len: Int,
 ):
     var tid = global_idx.x
     if tid >= len:
         return
-    out[tid] = in0[tid] + in1[tid]
+    output[tid] = in0[tid] + in1[tid]
 
 
 fn test_concurrent_copy(ctx1: DeviceContext, ctx2: DeviceContext) raises:
@@ -82,7 +81,7 @@ fn test_concurrent_copy(ctx1: DeviceContext, ctx2: DeviceContext) raises:
 
     var block_dim = 1
 
-    ctx1.enqueue_function_checked(
+    ctx1.enqueue_function_experimental(
         dev_func,
         in0_dev1,
         in1_dev1,
@@ -93,7 +92,7 @@ fn test_concurrent_copy(ctx1: DeviceContext, ctx2: DeviceContext) raises:
     )
     out_dev1.reassign_ownership_to(ctx2)
     out_dev1.enqueue_copy_to(out_host1)
-    ctx1.enqueue_function_checked(
+    ctx1.enqueue_function_experimental(
         dev_func,
         in0_dev2,
         in1_dev2,
@@ -104,7 +103,7 @@ fn test_concurrent_copy(ctx1: DeviceContext, ctx2: DeviceContext) raises:
     )
     out_dev2.reassign_ownership_to(ctx2)
     out_dev2.enqueue_copy_to(out_host2)
-    ctx1.enqueue_function_checked(
+    ctx1.enqueue_function_experimental(
         dev_func,
         in0_dev3,
         in1_dev3,
@@ -199,7 +198,7 @@ fn test_concurrent_func(ctx1: DeviceContext, ctx2: DeviceContext) raises:
 
     var block_dim = 1
 
-    ctx1.enqueue_function_checked(
+    ctx1.enqueue_function_experimental(
         dev_func1,
         in_dev1,
         in_dev4,
@@ -209,7 +208,7 @@ fn test_concurrent_func(ctx1: DeviceContext, ctx2: DeviceContext) raises:
         block_dim=(block_dim),
     )
     ctx2.enqueue_wait_for(ctx1)
-    ctx2.enqueue_function_checked(
+    ctx2.enqueue_function_experimental(
         dev_func2,
         in_dev2,
         out_dev1,
@@ -218,7 +217,7 @@ fn test_concurrent_func(ctx1: DeviceContext, ctx2: DeviceContext) raises:
         grid_dim=(length // block_dim),
         block_dim=(block_dim),
     )
-    ctx1.enqueue_function_checked(
+    ctx1.enqueue_function_experimental(
         dev_func1,
         in_dev3,
         in_dev5,
@@ -228,7 +227,7 @@ fn test_concurrent_func(ctx1: DeviceContext, ctx2: DeviceContext) raises:
         block_dim=(block_dim),
     )
     ctx2.enqueue_wait_for(ctx1)
-    ctx2.enqueue_function_checked(
+    ctx2.enqueue_function_experimental(
         dev_func2,
         out_dev2,
         out_dev3,

@@ -17,7 +17,7 @@ from buffer.dimlist import DimList
 from layout import IntTuple, Layout
 from sys import alignof
 
-from utils import IndexList, StaticTuple
+from utils import IndexList
 
 
 fn __mogg_intrinsic_attr(intrin: StaticString):
@@ -53,12 +53,11 @@ fn _row_major_strides[rank: Int](shape: DimList) -> DimList:
 
 
 # Compile time Tensor informations
-@value
 @register_passable("trivial")
 struct StaticTensorSpec[
     dtype: DType,
     rank: Int,
-]:
+](Copyable, Movable):
     # Represents the DimList type (not accessible from KGEN tests).
     alias in_lambda_t = fn[simd_width: Int] (IndexList[rank]) capturing -> SIMD[
         dtype, simd_width

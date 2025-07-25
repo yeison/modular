@@ -12,27 +12,18 @@
 # ===----------------------------------------------------------------------=== #
 from collections import OptionalReg
 from math import ceildiv
-from pathlib import Path
-from sys import alignof, simdwidthof, sizeof
-from sys._assembly import inlined_assembly
+from sys import simdwidthof, sizeof
 
-import linalg.vendor_blas
 from buffer.buffer import NDBuffer
-from buffer.dimlist import Dim, DimList, _make_tuple
-from gpu import MAX_THREADS_PER_BLOCK_METADATA, WARP_SIZE, barrier
+from buffer.dimlist import DimList
+from gpu import MAX_THREADS_PER_BLOCK_METADATA, barrier
 from gpu.cluster import (
-    block_rank_in_cluster,
     cluster_sync,
     cluster_sync_relaxed,
     elect_one_sync,
 )
-from gpu.grid_controls import (
-    launch_dependent_grids,
-    pdl_launch_attributes,
-    wait_on_dependent_grids,
-)
+from gpu.globals import WARPGROUP_SIZE
 from gpu.host import DeviceContext, FuncAttribute
-from gpu.host._compile import _compile_code_asm, _get_gpu_target
 from gpu.host._nvidia_cuda import TensorMapSwizzle
 from gpu.host.info import H100
 from gpu.id import (
@@ -41,34 +32,16 @@ from gpu.id import (
     block_idx,
     global_idx,
     grid_dim,
-    lane_id,
     thread_idx,
 )
 from gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from gpu.memory import AddressSpace, external_memory, fence_mbarrier_init
-from gpu.mma import (
-    WGMMADescriptor,
-    st_matrix,
-    wgmma_async,
-    wgmma_commit_group_sync,
-    wgmma_fence_aligned,
-    wgmma_wait_group_sync,
-)
-from gpu.sync import cp_async_bulk_wait_group, named_barrier
-from gpu.warp import broadcast
 from layout import IntTuple, Layout, LayoutTensor
 from layout._ndbuffer_stub import from_ndbuffer_row_major
-from layout._utils import ManagedLayoutTensor
-from layout.layout_tensor import (
-    LayoutTensorIter,
-    copy_local_to_dram,
-    copy_sram_to_dram,
-)
-from layout.runtime_layout import UNKNOWN_VALUE, RuntimeLayout, RuntimeTuple
-from layout.swizzle import make_ldmatrix_swizzle, make_swizzle
+from layout.layout_tensor import LayoutTensorIter
+from layout.runtime_layout import UNKNOWN_VALUE, RuntimeLayout
 from layout.tensor_core_async import (
     TensorCoreAsync,
-    st_matrix_n_layout,
     tile_layout_k_major,
 )
 from layout.tma_async import (
@@ -81,13 +54,9 @@ from linalg.matmul_sm90 import (
     _get_c_smem_layout,
     cluster_size,
     consumer_main_loop,
-    producer_main_loop,
     warp_specialized_gemm_output,
 )
-from linalg.matmul_tile_scheduler import MatmulSchedule, TileScheduler
-from memory import bitcast, stack_allocation
-from memory.pointer import _GPUAddressSpace
-from stdlib.bit import log2_floor
+from linalg.matmul_loadop_sm90 import async_load_AB
 
 from utils.index import Index, IndexList
 from utils.numerics import get_accum_type
@@ -95,9 +64,6 @@ from utils.static_tuple import StaticTuple
 
 from .utils import elementwise_epilogue_type
 from .utils_gpu import MatmulConfig, block_swizzle
-
-alias WARP_GROUP_SIZE = 128
-alias NumWarpPerWarpGroup = 4
 
 # ===----------------------------------------------------------------------=== #
 # Naive grouped matmul
@@ -113,6 +79,7 @@ fn naive_grouped_matmul[
     b_shape: DimList, //,
     *,
     transpose_b: Bool = True,
+    elementwise_lambda_fn: OptionalReg[elementwise_epilogue_type] = None,
 ](
     c: NDBuffer[mut=True, c_type, 2, MutableAnyOrigin, c_shape],
     a: NDBuffer[a_type, 2, MutableAnyOrigin, a_shape],
@@ -133,6 +100,7 @@ fn naive_grouped_matmul[
             a_shape,
             b_type,
             b_shape,
+            elementwise_lambda_fn=elementwise_lambda_fn,
         ]
     ](
         c,
@@ -156,6 +124,8 @@ fn naive_grouped_matmul_kernel[
     a_shape: DimList,
     b_type: DType,
     b_shape: DimList,
+    *,
+    elementwise_lambda_fn: OptionalReg[elementwise_epilogue_type] = None,
 ](
     c: NDBuffer[mut=True, c_type, 2, MutableAnyOrigin, c_shape],
     a: NDBuffer[a_type, 2, MutableAnyOrigin, a_shape],
@@ -191,8 +161,15 @@ fn naive_grouped_matmul_kernel[
             * b_by_expert[n * K + k].cast[accum_type]()
         )
 
-    c_by_expert = c.data + a_start_row * N
-    c_by_expert[m * N + n] = accum.cast[c_type]()
+    @parameter
+    if elementwise_lambda_fn:
+        alias elementwise_lambda = elementwise_lambda_fn.value()
+        elementwise_lambda[c_type, 1](
+            Index(a_start_row + m, n), accum.cast[c_type]()
+        )
+    else:
+        c_by_expert = c.data + a_start_row * N
+        c_by_expert[m * N + n] = accum.cast[c_type]()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -311,7 +288,7 @@ fn grouped_matmul_sm90[
         swizzle_mode=c_swizzle,
     ](ctx, c_tensor)
 
-    alias num_threads = WARP_GROUP_SIZE * config.num_consumer + WARP_GROUP_SIZE
+    alias num_threads = WARPGROUP_SIZE * config.num_consumer + WARPGROUP_SIZE
     alias smem_size = Int(config.num_pipeline_stages) * (
         BM * BK * sizeof[a_type]()
         + BN * BK * sizeof[b_type]()
@@ -504,9 +481,9 @@ fn grouped_matmul_kernel[
     full = a_mbars_ptr.bitcast[SharedMemBarrier]()
     empty = b_mbars_ptr.bitcast[SharedMemBarrier]()
 
-    var warp_group_idx = thread_idx.x // WARP_GROUP_SIZE
-    var warp_group_thread_idx = thread_idx.x % WARP_GROUP_SIZE
-    var num_k_iters = K // BK
+    var warp_group_idx = thread_idx.x // WARPGROUP_SIZE
+    var warp_group_thread_idx = thread_idx.x % WARPGROUP_SIZE
+    alias num_k_iters = K // BK
 
     var rank_m = block_id_in_cluster.y
     var rank_n = block_id_in_cluster.x
@@ -548,18 +525,19 @@ fn grouped_matmul_kernel[
                 + UInt(block_idx_swizzle[0]) * BN
             )
 
-            producer_main_loop[
+            async_load_AB[
                 block_tile_shape=block_tile_shape,
                 cluster_shape=cluster_shape,
                 partitioned_multicast=False,
+                num_k_iters=num_k_iters,
             ](
                 a_tma_op,
                 b_tma_op,
                 a_smem_iter,
                 b_smem_iter,
-                num_k_iters,
                 m_coord,
                 n_coord,
+                0,
                 rank_n,
                 rank_m,
                 write_pipeline_states,
@@ -610,6 +588,7 @@ fn grouped_matmul_kernel[
         consumer_main_loop[
             cluster_shape=cluster_shape,
             num_consumer=num_consumer,
+            num_k_iters=num_k_iters,
         ](
             dummy_c_reg_tile,
             c_reg_tile,
@@ -619,7 +598,6 @@ fn grouped_matmul_kernel[
             full,
             empty,
             wgmma_op,
-            num_k_iters,
             local_warp_group_idx,
             warp_group_thread_idx,
         )
@@ -634,18 +612,25 @@ fn grouped_matmul_kernel[
             address_space = AddressSpace.GENERIC,
         ]
 
-        c_gmem_runtime_layout = RuntimeLayout[
-            c_gmem_layout,
-            element_type = c_gmem_type.layout_int_type,
-            linear_idx_type = c_gmem_type.linear_idx_type,
-        ](
-            Index[dtype = c_gmem_type.layout_int_type](M, N),
-            Index[dtype = c_gmem_type.linear_idx_type](N, 1),
+        # FIXME: A list literal initializer should be enough here, but somehow Mojo fails to infer that.
+        var c_gmem_runtime_layout = RuntimeLayout[c_gmem_layout](
+            Index(M, N), Index(N, 1)
         )
 
         var c_by_expert = c_gmem_type(
             c.ptr + a_start_row * N, c_gmem_runtime_layout
         )
+
+        @always_inline
+        @parameter
+        fn elementwise_epilogue_fn_wrapper[
+            dtype: DType, width: Int, *, alignment: Int = 1
+        ](idx: IndexList[2], val: SIMD[dtype, width]):
+            @parameter
+            if elementwise_lambda_fn:
+                alias elementwise_epilogue = elementwise_lambda_fn.value()
+                var batch_idx = IndexList[2](Int(a_start_row + idx[0]), idx[1])
+                elementwise_epilogue(batch_idx, val)
 
         warp_specialized_gemm_output[
             c_tile_shape = Index(BM, BN),
@@ -653,7 +638,9 @@ fn grouped_matmul_kernel[
             wgmma_shape=wgmma_shape,
             num_consumer=num_consumer,
             use_tma_store=use_tma_store,
-            elementwise_lambda_fn=elementwise_lambda_fn,
+            elementwise_lambda_fn = OptionalReg[elementwise_epilogue_type](
+                elementwise_epilogue_fn_wrapper
+            ) if elementwise_lambda_fn else None,
         ](
             c_tma_op,
             c_by_expert,
@@ -661,7 +648,7 @@ fn grouped_matmul_kernel[
             c_reg_tile,
             warp_group_thread_idx,
             local_warp_group_idx,
-            thread_idx.x - WARP_GROUP_SIZE,
+            thread_idx.x - WARPGROUP_SIZE,
             block_idx_swizzle[1],
             block_idx_swizzle[0],
         )
@@ -684,6 +671,7 @@ fn grouped_matmul[
     a_shape: DimList,
     b_type: DType,
     b_shape: DimList, //,
+    elementwise_lambda_fn: OptionalReg[elementwise_epilogue_type] = None,
 ](
     c: NDBuffer[mut=True, c_type, 2, MutableAnyOrigin, c_shape],
     a: NDBuffer[a_type, 2, MutableAnyOrigin, a_shape],
@@ -701,7 +689,7 @@ fn grouped_matmul[
 
     @parameter
     if is_sm90_kernel_applicable:
-        grouped_matmul_sm90(
+        grouped_matmul_sm90[elementwise_lambda_fn=elementwise_lambda_fn](
             c,
             a,
             a_offsets,
@@ -712,7 +700,7 @@ fn grouped_matmul[
             ctx,
         )
     else:
-        naive_grouped_matmul(
+        naive_grouped_matmul[elementwise_lambda_fn=elementwise_lambda_fn](
             c,
             a,
             b,

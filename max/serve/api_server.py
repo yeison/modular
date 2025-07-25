@@ -19,17 +19,17 @@ import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
+from typing import Union
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
-from max.pipelines.core import (
-    PipelineAudioTokenizer,
-    PipelinesFactory,
-    PipelineTask,
-    PipelineTokenizer,
-)
+from max.interfaces import PipelineTask, PipelineTokenizer
+from max.nn.kv_cache import KVTransferEngineMetadata
+from max.pipelines.core import PipelinesFactory
+from max.pipelines.lib import PipelineConfig
 from max.serve.config import APIType, MetricRecordingMethod, Settings
 from max.serve.kvcache_agent.dispatcher_factory import DispatcherFactory
+from max.serve.kvcache_agent.dispatcher_transport import TransportMessage
 from max.serve.pipelines.kvcache_worker import start_kvcache_agent
 from max.serve.pipelines.llm import (
     AudioGeneratorPipeline,
@@ -41,7 +41,10 @@ from max.serve.recordreplay.jsonl import JSONLFileRecorder
 from max.serve.recordreplay.middleware import RecorderMiddleware
 from max.serve.request import register_request
 from max.serve.router import kserve_routes, openai_routes, sagemaker_routes
-from max.serve.scheduler import TokenGeneratorSchedulerConfig
+from max.serve.scheduler import (
+    PrefillRequest,
+    PrefillResponse,
+)
 from max.serve.telemetry.common import send_telemetry_log
 from max.serve.telemetry.metrics import METRICS
 from uvicorn import Config
@@ -60,7 +63,7 @@ class ServingTokenGeneratorSettings:
     # Pipeline config
     model_name: str
     model_factory: PipelinesFactory
-    pipeline_config: TokenGeneratorSchedulerConfig
+    pipeline_config: PipelineConfig
     tokenizer: PipelineTokenizer
     pipeline_task: PipelineTask = PipelineTask.TEXT_GENERATION
 
@@ -86,7 +89,18 @@ async def lifespan(
     try:
         async with AsyncExitStack() as exit_stack:
             # create dispatcher factory
-            dispatcher_factory = DispatcherFactory(settings.dispatcher_config)
+            dispatcher_factory = DispatcherFactory[
+                Union[PrefillRequest, PrefillResponse, KVTransferEngineMetadata]
+            ](
+                settings.dispatcher_config,
+                transport_payload_type=TransportMessage[
+                    Union[
+                        PrefillRequest,
+                        PrefillResponse,
+                        KVTransferEngineMetadata,
+                    ]
+                ],
+            )
 
             if settings.experimental_enable_kvcache_agent:
                 logger.info("Starting KV Cache Agent...")
@@ -108,7 +122,8 @@ async def lifespan(
                     serving_settings.pipeline_config,
                     settings,
                     metric_client,
-                    dispatcher_factory,
+                    serving_settings.pipeline_task,
+                    dispatcher_factory=dispatcher_factory,
                 )
             )
 
@@ -126,9 +141,6 @@ async def lifespan(
             elif (
                 serving_settings.pipeline_task == PipelineTask.AUDIO_GENERATION
             ):
-                assert isinstance(
-                    serving_settings.tokenizer, PipelineAudioTokenizer
-                )
                 pipeline = AudioGeneratorPipeline(
                     model_name=serving_settings.model_name,
                     tokenizer=serving_settings.tokenizer,
@@ -145,6 +157,7 @@ async def lifespan(
                 f"\n\n**********\nServer ready on http://{settings.host}:{settings.port} (Press CTRL+C to quit)\n**********\n"
             )
             yield
+    # TODO: Will we ever get here? KeyboardInterrupt is handled in the serve.py entrypoint.
     except KeyboardInterrupt as e:
         # Exit gracefully if user used Ctrl+C
         logger.info("Workers have shut down successfully (keyboard interrupt)")
@@ -166,6 +179,11 @@ def version():
         return JSONResponse({"version": "unknown"})
 
 
+async def health() -> Response:
+    """Health check, tools like lm-eval use this to check for readiness."""
+    return Response(status_code=200)
+
+
 def make_metrics_app():
     from prometheus_client import disable_created_metrics, make_asgi_app
 
@@ -178,19 +196,18 @@ def fastapi_app(
     serving_settings: ServingTokenGeneratorSettings,
 ) -> FastAPI:
     logger.info(f"Settings: {settings}")
+
     app = FastAPI(
         title="MAX Serve",
         lifespan=partial(
-            lifespan,
-            settings=settings,
-            serving_settings=serving_settings,
+            lifespan, settings=settings, serving_settings=serving_settings
         ),
     )
 
     if settings.transaction_recording_file is not None:
         transaction_recording_file = settings.transaction_recording_file
         app.add_middleware(
-            RecorderMiddleware,
+            RecorderMiddleware,  # type: ignore
             recorder_factory=(
                 lambda: JSONLFileRecorder(transaction_recording_file)
             ),
@@ -204,6 +221,7 @@ def fastapi_app(
         app.mount("/metrics", make_metrics_app())
 
     app.add_api_route("/version", version)
+    app.add_api_route("/health", health)
 
     for api_type in settings.api_types:
         app.include_router(ROUTES[api_type].router)

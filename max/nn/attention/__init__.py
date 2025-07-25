@@ -19,25 +19,37 @@ from .attention_with_rope import (
     DistributedAttentionWithRope,
     GGUFQAttentionWithRope,
     GPTQAttentionWithRope,
-    LatentAttentionWithRope,
 )
 from .interfaces import (
     AttentionImpl,
     AttentionImplQKV,
     DistributedAttentionImpl,
 )
+from .mask_config import (
+    AttentionMaskVariant,
+    MHAMaskConfig,
+    MHAMaskVariant,
+    PositionalEncodingVariant,
+)
+from .multi_latent_attention import LatentAttentionWithRope
+from .multihead_attention import MultiheadAttention
 from .ragged_attention import RaggedAttention
 
 __all__ = [
     "AttentionImpl",
     "AttentionImplQKV",
+    "AttentionMaskVariant",
+    "AttentionWithRope",
+    "AttentionWithRopeQKV",
     "AttentionWithRopeV1",
     "DistributedAttentionImpl",
     "DistributedAttentionWithRope",
-    "AttentionWithRopeQKV",
-    "RaggedAttention",
-    "AttentionWithRope",
-    "GPTQAttentionWithRope",
     "GGUFQAttentionWithRope",
+    "GPTQAttentionWithRope",
     "LatentAttentionWithRope",
+    "MHAMaskConfig",
+    "MHAMaskVariant",
+    "MultiheadAttention",
+    "PositionalEncodingVariant",
+    "RaggedAttention",
 ]

@@ -16,15 +16,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, no_type_check
 
+from max.interfaces import AudioGenerationResponse
 from max.nn import ReturnLogits
 from max.pipelines.core import (
-    AudioGenerationResponse,
     AudioGenerator,
     TTSContext,
 )
 
 if TYPE_CHECKING:
     from .config import PipelineConfig
+
 from .pipeline import PipelineModel
 
 
@@ -64,15 +65,19 @@ class AudioGeneratorPipeline(AudioGenerator[TTSContext]):
         self.speech_lm_pipeline = self.pipeline_model.speech_lm_pipeline
 
     def next_chunk(
-        self, batch: dict[str, TTSContext], num_tokens: int
+        self, batch: dict[str, TTSContext]
     ) -> dict[str, AudioGenerationResponse]:
-        next_chunk = getattr(self.pipeline_model, "next_chunk")  # type: ignore[has-type]
-        return next_chunk(batch, num_tokens)
+        next_chunk = getattr(self.pipeline_model, "next_chunk")  # type: ignore[has-type]  # noqa: B009
+        return next_chunk(batch)
 
     def release(self, context: TTSContext) -> None:
-        release = getattr(self.pipeline_model, "release")  # type: ignore[has-type]
+        release = getattr(self.pipeline_model, "release")  # type: ignore[has-type]  # noqa: B009
         release(context)
 
     @property
     def decoder_sample_rate(self) -> int:
-        return getattr(self.pipeline_model, "decoder_sample_rate")  # type: ignore[has-type]
+        return getattr(self.pipeline_model, "decoder_sample_rate")  # type: ignore[has-type]  # noqa: B009
+
+    @property
+    def prev_num_steps(self) -> int:
+        return getattr(self.pipeline_model, "prev_num_steps")  # type: ignore[has-type]  # noqa: B009

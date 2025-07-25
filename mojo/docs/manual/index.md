@@ -64,12 +64,15 @@ feedback](https://www.modular.com/community).
 
 - **GPU programming**
 
+  - [Intro to GPUs](/mojo/manual/gpu/architecture)
   - [Get started with GPU programming](/mojo/manual/gpu/intro-tutorial)
+  - [GPU programming fundamentals](/mojo/manual/gpu/fundamentals)
   - [GPU basics](/mojo/manual/gpu/basics)
 
 - **Layouts and LayoutTensor**
 
-  - [Introduction to Layouts](/mojo/manual/layout/layouts)
+  - [Introduction to layouts](/mojo/manual/layout/layouts)
+  - [Using LayoutTensor](/mojo/manual/layout/tensors)
 
 - **Python**
 

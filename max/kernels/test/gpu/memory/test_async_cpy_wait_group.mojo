@@ -17,13 +17,12 @@ from gpu import thread_idx
 from gpu.host import DeviceContext
 from gpu.memory import (
     AddressSpace,
-    Fill,
     async_copy,
     async_copy_commit_group,
     async_copy_wait_all,
     async_copy_wait_group,
 )
-from memory import UnsafePointer, stack_allocation
+from memory import stack_allocation
 from testing import assert_equal
 
 
@@ -50,7 +49,6 @@ fn copy_via_shared(
     dst[thread_id] = mem_buff[thread_id]
 
 
-# CHECK-LABEL: run_copy_via_shared
 fn run_copy_via_shared(ctx: DeviceContext) raises:
     print("== run_copy_via_shared")
     var in_data = UnsafePointer[Float32].alloc(16)

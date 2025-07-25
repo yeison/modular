@@ -10,7 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo %s
 
 from math import gcd
 from sys import (
@@ -22,7 +21,7 @@ from sys import (
 )
 from sys.intrinsics import assume, likely, unlikely
 
-from memory import UnsafePointer, memset_zero
+from memory import memset_zero
 from testing import assert_equal
 
 alias F32x4 = SIMD[DType.float32, 4]

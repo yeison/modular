@@ -176,9 +176,9 @@ class VisionModel(Layer):
     def _manual_constant_pad_4d(
         self,
         dtype: DType,
-        input_tensor,
+        input_tensor,  # noqa: ANN001
         pad: tuple[int, int, int, int],
-        value=0,
+        value=0,  # noqa: ANN001
     ) -> TensorValue:
         """
         Manually pads a 4D tensor (batch of images) with constant values.
@@ -318,10 +318,7 @@ class VisionModel(Layer):
         )  # (pad_left, pad_right, pad_left for dim -2, pad_right for dim -2)
         # Pad the tensor
         hidden_state = self._manual_constant_pad_4d(
-            dtype=self.dtype,
-            input_tensor=hidden_state,
-            pad=padding,
-            value=0,
+            dtype=self.dtype, input_tensor=hidden_state, pad=padding, value=0
         )
 
         slice_index = -num_padding_patches if num_padding_patches > 0 else None
@@ -514,8 +511,7 @@ def instantiate_vision_model(
         ),
         embedding=EmbeddingV1(
             weights.vision_model.pre_tile_positional_embedding.embedding.weight.allocate(
-                dtype,
-                [max_aspect_ratio_id, max_num_tiles * hidden_size],
+                dtype, [max_aspect_ratio_id, max_num_tiles * hidden_size]
             ),
             device=device,
         ),

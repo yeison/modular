@@ -14,13 +14,12 @@
 
 
 import sys._libc as libc
-from collections.string import StringSlice
 from sys import external_call
 from sys._libc import FILE_ptr, pclose, popen
 from sys.ffi import c_char
 from sys.info import os_is_windows
 
-from memory import Span, UnsafePointer
+from memory import Span
 
 
 struct _POpenHandle:
@@ -28,7 +27,7 @@ struct _POpenHandle:
 
     var _handle: FILE_ptr
 
-    fn __init__(out self, owned cmd: String, owned mode: String = "r") raises:
+    fn __init__(out self, var cmd: String, var mode: String = "r") raises:
         """Construct the _POpenHandle using the command and mode provided.
 
         Args:

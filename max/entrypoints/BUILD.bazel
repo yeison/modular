@@ -7,7 +7,9 @@ modular_py_library(
     srcs = glob(
         ["**/*.py"],
         exclude = [
+            "_package_root.py",
             "mojo.py",
+            "gpu_query.py",
             "pipelines.py",
             "replay_recording.py",
         ],
@@ -27,7 +29,6 @@ modular_py_library(
         requirement("pillow"),
         requirement("psutil"),
         requirement("requests"),
-        requirement("soundfile"),
         requirement("tokenizers"),
         requirement("tqdm"),
         requirement("transformers"),
@@ -37,13 +38,40 @@ modular_py_library(
 )
 
 modular_py_library(
+    name = "_package_root",
+    srcs = ["_package_root.py"],
+    visibility = ["//visibility:public"],
+)
+
+modular_py_library(
     name = "mojo",
     srcs = ["mojo.py"],
     data = [
         "//KGEN/tools/mojo",
-        "//open-source/max/mojo/stdlib/stdlib",
+        "@mojo//:stdlib",
     ],
     visibility = ["//visibility:public"],
+    deps = [":_package_root"],
+)
+
+modular_py_library(
+    name = "_pipelines",
+    srcs = [
+        "pipelines.py",
+    ],
+    deps = [
+        "//SDK/lib/API/python/max/entrypoints",
+        "//SDK/lib/API/python/max/interfaces",
+        "//SDK/lib/API/python/max/nn",
+        "//SDK/lib/API/python/max/pipelines",
+        "//SDK/lib/API/python/max/pipelines/architectures",
+        "//SDK/lib/API/python/max/serve",
+        requirement("click"),
+        requirement("huggingface-hub"),
+        requirement("pillow"),
+        requirement("transformers"),
+        requirement("uvicorn"),
+    ],
 )
 
 modular_py_binary(
@@ -65,16 +93,8 @@ modular_py_binary(
         "//conditions:default": {},
     }),
     deps = [
-        "//SDK/lib/API/python/max/entrypoints",
-        "//SDK/lib/API/python/max/nn",
-        "//SDK/lib/API/python/max/pipelines",
-        "//SDK/lib/API/python/max/pipelines/architectures",
-        "//SDK/lib/API/python/max/serve",
+        ":_pipelines",
         requirement("click"),
-        requirement("huggingface-hub"),
-        requirement("pillow"),
-        requirement("transformers"),
-        requirement("uvicorn"),
     ],
 )
 
@@ -105,4 +125,11 @@ pkg_filegroup(
         ":python_files",
         "//open-source/max/benchmark:python_files",
     ],
+)
+
+modular_py_library(
+    name = "gpu-query",
+    srcs = ["gpu_query.py"],
+    visibility = ["//visibility:public"],
+    deps = [":_package_root"],
 )

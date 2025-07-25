@@ -14,9 +14,7 @@
 from math import align_down, ceildiv, sqrt
 from sys._build import is_debug_build
 from sys.info import (
-    has_avx2,
-    has_avx512f,
-    has_neon,
+    CompilationTarget,
     is_neoverse_n1,
     os_is_macos,
     simdwidthof,
@@ -25,6 +23,7 @@ from sys.info import (
 
 from buffer import NDBuffer
 from buffer.dimlist import Dim, DimList
+from layout import LayoutTensor
 from linalg.utils import partition_work
 
 from utils.index import Index, IndexList
@@ -42,8 +41,8 @@ alias elementwise_epilogue_type = fn[rank: Int] (
     f_size: Int,
 ) capturing -> None
 
-alias elementwise_simd_epilogue_type = fn[type: DType, rank: Int, width: Int] (
-    IndexList[rank], SIMD[type, width]
+alias elementwise_simd_epilogue_type = fn[dtype: DType, rank: Int, width: Int] (
+    IndexList[rank], SIMD[dtype, width]
 ) capturing -> None
 
 
@@ -52,9 +51,9 @@ alias elementwise_simd_epilogue_type = fn[type: DType, rank: Int, width: Int] (
 # ===----------------------------------------------------------------------=== #
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct ConvShape[rank: Int]:
+struct ConvShape[rank: Int](Copyable, Movable):
     """A shape struct describing the convolution dimensions."""
 
     var n: Int  # Input batch size.
@@ -278,6 +277,52 @@ fn get_conv_shape[
     rank: Int,
     filter_packed: Bool,
 ](
+    output: LayoutTensor,
+    input: LayoutTensor,
+    filter: LayoutTensor,
+    stride: IndexList[rank],
+    dilation: IndexList[rank],
+    pad_d: IndexList[2],
+    pad_h: IndexList[2],
+    pad_w: IndexList[2],
+    num_groups: Int,
+) -> ConvShape[rank]:
+    var output_dims = IndexList[rank](0)
+    var input_dims = IndexList[rank](0)
+    var filter_dims = IndexList[rank](0)
+
+    @parameter
+    for i in range(rank):
+        output_dims[i] = output.dim[i + 1]()
+        input_dims[i] = input.dim[i + 1]()
+
+        @parameter
+        if filter_packed:
+            filter_dims[i] = filter.dim[i + 1]()
+        else:
+            filter_dims[i] = filter.dim[i]()
+
+    return ConvShape[rank](
+        n=input.dim[0](),
+        input_dims=input_dims,
+        output_dims=output_dims,
+        filter_dims=filter_dims,
+        c=input.dim[rank + 1](),
+        f=output.dim[rank + 1](),
+        stride=stride,
+        dilation=dilation,
+        pad_d=pad_d,
+        pad_h=pad_h,
+        pad_w=pad_w,
+        num_groups=num_groups,
+    )
+
+
+@always_inline
+fn get_conv_shape[
+    rank: Int,
+    filter_packed: Bool,
+](
     output: NDBuffer,
     input: NDBuffer,
     filter: NDBuffer,
@@ -323,13 +368,13 @@ fn get_conv2d_shape[
     output_shape: DimList,
     input_shape: DimList,
     filter_shape: DimList,
-    type: DType,
+    dtype: DType,
     data_layout: Image2DLayout,
     filter_layout: Image2DLayout,
 ](
-    output: NDBuffer[mut=True, type, 4, _, output_shape],
-    input: NDBuffer[type, 4, _, input_shape],
-    filter: NDBuffer[type, 4, _, filter_shape],
+    output: NDBuffer[mut=True, dtype, 4, _, output_shape],
+    input: NDBuffer[dtype, 4, _, input_shape],
+    filter: NDBuffer[dtype, 4, _, filter_shape],
     pad_h: IndexList[2],
     pad_w: IndexList[2],
     stride: IndexList[2],
@@ -363,13 +408,13 @@ fn get_conv2d_shape[
     output_shape: DimList,
     input_shape: DimList,
     filter_shape: DimList,
-    type: DType,
+    dtype: DType,
     data_layout: Image2DLayout,
     filter_layout: Image2DLayout,
 ](
-    output: NDBuffer[mut=True, type, 4, _, output_shape],
-    input: NDBuffer[type, 4, _, input_shape],
-    filter: NDBuffer[type, filter_rank, _, filter_shape],
+    output: NDBuffer[mut=True, dtype, 4, _, output_shape],
+    input: NDBuffer[dtype, 4, _, input_shape],
+    filter: NDBuffer[dtype, filter_rank, _, filter_shape],
     pad_h: IndexList[2],
     pad_w: IndexList[2],
     stride: IndexList[2],
@@ -407,7 +452,7 @@ fn get_conv2d_shape[
 
 
 @always_inline
-fn get_conv_tile_size[type: DType]() -> Int:
+fn get_conv_tile_size[dtype: DType]() -> Int:
     # The rule-of-thumb is 1/2 of L2 cache size. It's common to have 3x3
     # filter window in convolution. So the cache tile size (in terms of
     # elements) is rounded up to multiple of 9.
@@ -416,35 +461,35 @@ fn get_conv_tile_size[type: DType]() -> Int:
     # See MatmulUtils for context on tile size for debug built and macos.
     @parameter
     if is_debug_build():
-        return 4 * KB // sizeof[type]()
+        return 4 * KB // sizeof[dtype]()
 
     @parameter
     if os_is_macos():
-        return 64 * KB // sizeof[type]()
+        return 64 * KB // sizeof[dtype]()
 
     @parameter
-    if has_neon() or has_avx512f():
+    if CompilationTarget.has_neon() or CompilationTarget.has_avx512f():
         #  Graviton 2 and Skylake server
         # have a 1 MiB L2 cache
-        return 576 * KB // sizeof[type]()
+        return 576 * KB // sizeof[dtype]()
 
     # AMD Rome has a 512 KiB L2 cache.
-    return 288 * KB // sizeof[type]()
+    return 288 * KB // sizeof[dtype]()
 
 
 @always_inline
 fn get_conv_tile_shape[
-    type: DType,
+    dtype: DType,
 ](c: Int, filter_window_size: Int, micro_kernel_width: Int,) -> IndexList[2]:
     """Compute the (c, f) tile shape in L2.
     Assume NHWC layout, the tile shape is (R, S, c_tile, f_tile). R and S are
     by default fully covered. The heuristic tried to block in C as much as
     possible. If C is small, it would start to block F.
     """
-    alias simd_size = simdwidthof[type]()
+    alias simd_size = simdwidthof[dtype]()
 
     # Number of elements in tile.
-    var tile_size = get_conv_tile_size[type]()
+    var tile_size = get_conv_tile_size[dtype]()
     # Number of elements in micro kernel's f dimension.
     var micro_kernel_f = micro_kernel_width * simd_size
     # Max C tile size, assuming R, S, and micro_kernel_f are covered.
@@ -513,7 +558,7 @@ fn reorder_padding[rank: Int](pad: DimList) -> DimList:
         )
 
 
-struct ConvInfoStatic[rank: Int]:
+struct ConvInfoStatic[rank: Int](Defaultable):
     var pad: DimList
     var stride: DimList
     var dilation: DimList
@@ -592,22 +637,22 @@ struct ConvInfoStatic[rank: Int]:
 
 fn get_direct_conv_micro_kernel_height() -> Int:
     @parameter
-    if has_avx512f():
+    if CompilationTarget.has_avx512f():
         return 6
     elif is_neoverse_n1():
         return 8
-    elif has_neon():  # neon other than neoverse-N1
+    elif CompilationTarget.has_neon():  # neon other than neoverse-N1
         return 6
     return 4
 
 
 fn get_direct_conv_micro_kernel_width() -> Int:
     @parameter
-    if has_avx512f():
+    if CompilationTarget.has_avx512f():
         return 4
     elif is_neoverse_n1():
         return 2
-    elif has_neon():  # neon other than neoverse-N1
+    elif CompilationTarget.has_neon():  # neon other than neoverse-N1
         return 4
     return 3
 
@@ -632,7 +677,7 @@ fn get_micro_kernel_shape[
         alias has_padding = pad_h_val != Index(0, 0) or pad_w_val != Index(0, 0)
 
         @parameter
-        if has_avx512f():
+        if CompilationTarget.has_avx512f():
             # The micro tile is m rows by n*simd_size columns.
             # The register usage in tiling for avx512/avx2:
             #   (1) load n registers in F dimension.
@@ -659,13 +704,13 @@ fn get_micro_kernel_shape[
             return Index(6, 4)
 
         @parameter
-        if has_avx2():
+        if CompilationTarget.has_avx2():
             if has_padding:
                 # Register usage formula is the same as avx512.
                 # There are in total 16 named simd registers, the viable micro kernels
                 # are (6, 2) and (4, 3).
 
-                # The heuristic searchs the micro kernel shape leading to the
+                # The heuristic searches the micro kernel shape leading to the
                 # least remainder. The following values will be overwritten since
                 # the residual is at most 2 * WO * F.
                 var min_num_residual = 3 * WO_val * F_val
@@ -687,7 +732,7 @@ fn get_micro_kernel_shape[
         @parameter
         if is_neoverse_n1():
             return Index(8, 2)
-        elif has_neon():  # neon other than neoverse-N1
+        elif CompilationTarget.has_neon():  # neon other than neoverse-N1
             return Index(6, 4)
 
         return Index(6, 2)
@@ -695,11 +740,11 @@ fn get_micro_kernel_shape[
     else:  # Default options for dynamic shapes.
 
         @parameter
-        if has_avx512f():
+        if CompilationTarget.has_avx512f():
             return Index(6, 4)
         elif is_neoverse_n1():
             return Index(8, 2)
-        elif has_neon():  # neon other than neoverse-N1
+        elif CompilationTarget.has_neon():  # neon other than neoverse-N1
             return Index(6, 4)
         # default, including AVX2
         else:
@@ -711,9 +756,9 @@ fn get_micro_kernel_shape[
 # ===-----------------------------------------------------------------------===#
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct ConvPartition:
+struct ConvPartition(Copyable, Movable):
     """Work range for a partition."""
 
     # Batch and group dims are merged into one.
@@ -760,7 +805,7 @@ fn get_conv_num_tasks(num_threads: Int, conv_shape: ConvShape) -> Int:
 fn get_conv_num_partitions[
     micro_kernel_w: Int, micro_kernel_f: Int
 ](num_threads: Int, conv_shape: ConvShape) -> IndexList[4]:
-    """Partition the worload in (batch, C, F, HOWO) dimensions.
+    """Partition the workload in (batch, C, F, HOWO) dimensions.
     HOWO is the combination of HO and WO dimensions.
     The actual number of tasks are the product of return num_partitions.
     """
@@ -772,10 +817,10 @@ fn get_conv_num_partitions[
     alias min_rows_per_task_avx512 = align_down(196, micro_kernel_w)
     alias min_c_per_task_avx512 = 64
     # Otherwise, discourage partitioning channel.
-    alias min_rows_per_task = min_rows_per_task_avx512 if has_avx512f() else align_down(
+    alias min_rows_per_task = min_rows_per_task_avx512 if CompilationTarget.has_avx512f() else align_down(
         64, micro_kernel_w
     )
-    alias min_c_per_task = min_c_per_task_avx512 if has_avx512f() else 1024
+    alias min_c_per_task = min_c_per_task_avx512 if CompilationTarget.has_avx512f() else 1024
 
     # alias min_rows_per_task = (196 // micro_kernel_w) * micro_kernel_w
     # alias min_c_per_task = 64
@@ -906,9 +951,9 @@ fn get_partition(
 # ===-----------------------------------------------------------------------===#
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct ConvAlgorithm:
+struct ConvAlgorithm(Copyable, Movable):
     var value: Int
     alias Default = ConvAlgorithm(0)  # statically unknown layout.
     alias Im2Col = ConvAlgorithm(1)  # channels first layout.

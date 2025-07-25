@@ -275,10 +275,50 @@ fn assert_equal[
 
 @always_inline
 fn assert_equal[
-    D: DType
+    O: ImmutableOrigin,
 ](
-    lhs: List[Scalar[D]],
-    rhs: List[Scalar[D]],
+    lhs: StringSlice[O],
+    rhs: String,
+    msg: String = "",
+    *,
+    location: Optional[_SourceLocation] = None,
+) raises:
+    """Asserts that a `StringSlice` is equal to a `String`."""
+    if lhs != rhs:
+        raise _assert_cmp_error["`left == right` comparison"](
+            lhs.__str__(),
+            rhs,
+            msg=msg,
+            loc=location.or_else(__call_location()),
+        )
+
+
+@always_inline
+fn assert_equal[
+    O: ImmutableOrigin,
+](
+    lhs: String,
+    rhs: StringSlice[O],
+    msg: String = "",
+    *,
+    location: Optional[_SourceLocation] = None,
+) raises:
+    """Asserts that a `String` is equal to a `StringSlice`."""
+    if lhs != rhs:
+        raise _assert_cmp_error["`left == right` comparison"](
+            lhs,
+            rhs.__str__(),
+            msg=msg,
+            loc=location.or_else(__call_location()),
+        )
+
+
+@always_inline
+fn assert_equal[
+    dtype: DType
+](
+    lhs: List[Scalar[dtype]],
+    rhs: List[Scalar[dtype]],
     msg: String = "",
     *,
     location: Optional[_SourceLocation] = None,
@@ -286,7 +326,7 @@ fn assert_equal[
     """Asserts that two lists are equal.
 
     Parameters:
-        D: A DType.
+        dtype: A DType.
 
     Args:
         lhs: The left-hand side list.
@@ -311,14 +351,14 @@ fn assert_equal[
 
 
 @always_inline
-fn assert_equal(
+fn assert_equal_pyobj(
     lhs: PythonObject,
     rhs: PythonObject,
     msg: String = "",
     *,
     location: Optional[_SourceLocation] = None,
 ) raises:
-    """Asserts that the input values are equal. If it is not then an Error
+    """Asserts that the `PythonObject`s are equal. If it is not then an Error
     is raised.
 
     Args:

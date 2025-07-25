@@ -13,13 +13,11 @@
 
 from collections import OptionalReg
 from math import iota
-from sys import bitwidthof, is_nvidia_gpu
+from sys import is_nvidia_gpu
 
 from buffer import DimList, NDBuffer
-from builtin.dtype import _int_type_of_width, _uint_type_of_width
 
 from utils.index import IndexList
-from utils.numerics import min_or_neg_inf
 
 # ===-----------------------------------------------------------------------===#
 # MaskName
@@ -59,9 +57,11 @@ struct MaskName(Stringable):
 # ===-----------------------------------------------------------------------===#
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct TileMaskStatus(EqualityComparable, Stringable, Writable):
+struct TileMaskStatus(
+    Copyable, EqualityComparable, Movable, Stringable, Writable
+):
     """A tile's masking status."""
 
     var status: UInt8
@@ -125,12 +125,12 @@ trait MHAMask:
     """
 
     fn mask[
-        type: DType, width: Int, //, *, element_type: DType = DType.uint32
+        dtype: DType, width: Int, //, *, element_type: DType = DType.uint32
     ](
         self,
         coord: IndexList[4, element_type=element_type],
-        score_vec: SIMD[type, width],
-    ) -> SIMD[type, width]:
+        score_vec: SIMD[dtype, width],
+    ) -> SIMD[dtype, width]:
         """Return mask vector at given coordinates.
 
         Arguments:
@@ -159,9 +159,9 @@ trait MHAMask:
 alias MASK_VALUE = -10_000
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct CausalMask(MHAMask):
+struct CausalMask(Copyable, MHAMask, Movable):
     """MHA causal mask ensures a token is only affected by previous tokens."""
 
     alias apply_log2e_after_mask: Bool = False
@@ -170,15 +170,15 @@ struct CausalMask(MHAMask):
 
     @always_inline
     fn mask[
-        type: DType,
+        dtype: DType,
         width: Int, //,
         *,
         element_type: DType = DType.uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
-        score_vec: SIMD[type, width],
-    ) -> SIMD[type, width]:
+        score_vec: SIMD[dtype, width],
+    ) -> SIMD[dtype, width]:
         alias index_type = coord.element_type
 
         # coord[2] and coord[3] are the token index in query and key respectively.
@@ -241,9 +241,9 @@ struct CausalMask(MHAMask):
 # ===-----------------------------------------------------------------------===#
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct NullMask(MHAMask):
+struct NullMask(Copyable, MHAMask, Movable):
     """Mask that's effectively a noop."""
 
     alias apply_log2e_after_mask: Bool = False
@@ -252,12 +252,12 @@ struct NullMask(MHAMask):
 
     @always_inline
     fn mask[
-        type: DType, width: Int, //, *, element_type: DType = DType.uint32
+        dtype: DType, width: Int, //, *, element_type: DType = DType.uint32
     ](
         self,
         coord: IndexList[4, element_type=element_type],
-        score_vec: SIMD[type, width],
-    ) -> SIMD[type, width]:
+        score_vec: SIMD[dtype, width],
+    ) -> SIMD[dtype, width]:
         return score_vec
 
     @always_inline
@@ -277,9 +277,9 @@ struct NullMask(MHAMask):
 # ===-----------------------------------------------------------------------===#
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct ChunkedMask[local_window_size: Int](MHAMask):
+struct ChunkedMask[local_window_size: Int](Copyable, MHAMask, Movable):
     """Mask implementing Chunked attention.
 
     This groups the mask into chunks of size `local_window_size`.
@@ -306,15 +306,15 @@ struct ChunkedMask[local_window_size: Int](MHAMask):
 
     @always_inline
     fn mask[
-        type: DType,
+        dtype: DType,
         width: Int, //,
         *,
         element_type: DType = DType.uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
-        score_vec: SIMD[type, width],
-    ) -> SIMD[type, width]:
+        score_vec: SIMD[dtype, width],
+    ) -> SIMD[dtype, width]:
         constrained[
             width <= local_window_size,
             "SIMD width of chunked mask must be <= local window size",
@@ -353,7 +353,7 @@ struct ChunkedMask[local_window_size: Int](MHAMask):
             return mask_val.select(MASK_VALUE, retval)
 
         # fully masked
-        return SIMD[type, width](MASK_VALUE)
+        return SIMD[dtype, width](MASK_VALUE)
 
     @always_inline
     fn status[
@@ -389,9 +389,9 @@ struct ChunkedMask[local_window_size: Int](MHAMask):
 # ===-----------------------------------------------------------------------===#
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct SlidingWindowCausalMask[window_size: Int](MHAMask):
+struct SlidingWindowCausalMask[window_size: Int](Copyable, MHAMask, Movable):
     """Mask implementing Sliding Window attention.
 
     Considering the following case:
@@ -417,15 +417,15 @@ struct SlidingWindowCausalMask[window_size: Int](MHAMask):
 
     @always_inline
     fn mask[
-        type: DType,
+        dtype: DType,
         width: Int, //,
         *,
         element_type: DType = DType.uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
-        score_vec: SIMD[type, width],
-    ) -> SIMD[type, width]:
+        score_vec: SIMD[dtype, width],
+    ) -> SIMD[dtype, width]:
         alias index_type = coord.element_type
 
         constrained[
@@ -449,7 +449,7 @@ struct SlidingWindowCausalMask[window_size: Int](MHAMask):
         return (
             SIMD[index_type, width](q_idx) - iota[index_type, width](k_idx)
             < window_size
-        ).select(masked_score_vec, SIMD[type, width](MASK_VALUE))
+        ).select(masked_score_vec, SIMD[dtype, width](MASK_VALUE))
 
     @always_inline
     fn status[
@@ -518,16 +518,17 @@ struct SlidingWindowCausalMask[window_size: Int](MHAMask):
 # ===-----------------------------------------------------------------------===#
 
 
-@value
 @register_passable("trivial")
-struct MaterializedMask[type_: DType, rank_: Int, shape_: DimList](MHAMask):
+struct MaterializedMask[dtype_: DType, rank_: Int, shape_: DimList](
+    Copyable, MHAMask, Movable
+):
     """Mask that's backed by a materialized tensor."""
 
     alias apply_log2e_after_mask: Bool = True
     alias mask_out_of_bound: Bool = True
     alias mask_safe_out_of_bounds: Bool = False
 
-    alias MaskType = NDBuffer[type_, rank_, MutableAnyOrigin, shape_]
+    alias MaskType = NDBuffer[dtype_, rank_, MutableAnyOrigin, shape_]
     var mask_tensor: Self.MaskType
     var start_pos: OptionalReg[NDBuffer[DType.uint32, 1, MutableAnyOrigin]]
     var is_multiple_of_2: Bool
@@ -556,15 +557,15 @@ struct MaterializedMask[type_: DType, rank_: Int, shape_: DimList](MHAMask):
 
     @always_inline
     fn mask[
-        type: DType,
+        dtype: DType,
         width: Int, //,
         *,
         element_type: DType = DType.uint32,
     ](
         self,
         coord: IndexList[4, element_type=element_type],
-        score_vec: SIMD[type, width],
-    ) -> SIMD[type, width]:
+        score_vec: SIMD[dtype, width],
+    ) -> SIMD[dtype, width]:
         alias IndexListType = IndexList[rank_, element_type=element_type]
         var adjusted_coord: IndexListType
 
@@ -580,7 +581,7 @@ struct MaterializedMask[type_: DType, rank_: Int, shape_: DimList](MHAMask):
                 coord[0], coord[1], coord[2] - start_pos, coord[3]
             )
 
-        var retval = SIMD[type, width](MASK_VALUE)
+        var retval = SIMD[dtype, width](MASK_VALUE)
         if adjusted_coord[rank_ - 2] < self.mask_tensor.dim[rank_ - 2]():
             if (
                 adjusted_coord[rank_ - 1] + width
@@ -589,7 +590,7 @@ struct MaterializedMask[type_: DType, rank_: Int, shape_: DimList](MHAMask):
             ):
                 retval = self.mask_tensor.load[width=width](
                     adjusted_coord
-                ).cast[type]()
+                ).cast[dtype]()
             elif adjusted_coord[rank_ - 1] < self.mask_tensor.dim[rank_ - 1]():
                 for i in range(
                     min(width, self.mask_tensor.dim[rank_ - 1]() - coord[3])
@@ -597,7 +598,7 @@ struct MaterializedMask[type_: DType, rank_: Int, shape_: DimList](MHAMask):
                     adjusted_coord[rank_ - 1] = coord[3] + i
                     retval[i] = self.mask_tensor.load[width=1](
                         adjusted_coord
-                    ).cast[type]()
+                    ).cast[dtype]()
 
         return score_vec + retval
 
@@ -619,9 +620,11 @@ struct MaterializedMask[type_: DType, rank_: Int, shape_: DimList](MHAMask):
 # ===-----------------------------------------------------------------------===#
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct AndMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](MHAMask):
+struct AndMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](
+    Copyable, MHAMask, Movable
+):
     """Mask that's the AND of two masks."""
 
     alias apply_log2e_after_mask: Bool = T.apply_log2e_after_mask or S.apply_log2e_after_mask
@@ -630,14 +633,14 @@ struct AndMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](MHAMask):
 
     @always_inline
     fn mask[
-        type: DType, width: Int, //, *, element_type: DType = DType.uint32
+        dtype: DType, width: Int, //, *, element_type: DType = DType.uint32
     ](
         self,
         coord: IndexList[4, element_type=element_type],
-        score_vec: SIMD[type, width],
-    ) -> SIMD[type, width]:
+        score_vec: SIMD[dtype, width],
+    ) -> SIMD[dtype, width]:
         @parameter
-        if type is DType.bool or type.is_integral():
+        if dtype is DType.bool or dtype.is_integral():
             return self.lhs.mask(coord, score_vec) & self.rhs.mask(
                 coord, score_vec
             )
@@ -667,9 +670,11 @@ struct AndMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](MHAMask):
 # ===-----------------------------------------------------------------------===#
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct OrMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](MHAMask):
+struct OrMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](
+    Copyable, MHAMask, Movable
+):
     """Mask that's the OR of two masks."""
 
     alias apply_log2e_after_mask: Bool = T.apply_log2e_after_mask or S.apply_log2e_after_mask
@@ -678,14 +683,14 @@ struct OrMask[T: MHAMask, S: MHAMask, //, lhs: T, rhs: S](MHAMask):
 
     @always_inline
     fn mask[
-        type: DType, width: Int, //, *, element_type: DType = DType.uint32
+        dtype: DType, width: Int, //, *, element_type: DType = DType.uint32
     ](
         self,
         coord: IndexList[4, element_type=element_type],
-        score_vec: SIMD[type, width],
-    ) -> SIMD[type, width]:
+        score_vec: SIMD[dtype, width],
+    ) -> SIMD[dtype, width]:
         @parameter
-        if type is DType.bool or type.is_integral():
+        if dtype is DType.bool or dtype.is_integral():
             return self.lhs.mask(coord, score_vec) | self.rhs.mask(
                 coord, score_vec
             )
@@ -737,4 +742,4 @@ fn ChunkedCausalMask[
         5 | 0 0 0 0 0 0 0 0 1 0
         6 | 0 0 0 0 0 0 0 0 1 1
     """
-    res = __type_of(res)()
+    res = {}

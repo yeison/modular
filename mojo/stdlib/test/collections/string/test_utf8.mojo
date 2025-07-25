@@ -10,15 +10,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo %s
 
 from collections.string._utf8 import (
     _count_utf8_continuation_bytes,
     _is_valid_utf8,
 )
-from sys.info import alignof, sizeof
 
-from memory import Span, UnsafePointer
 from testing import assert_equal, assert_false, assert_raises, assert_true
 
 # ===----------------------------------------------------------------------=== #
@@ -185,7 +182,7 @@ def test_stringslice_from_utf8():
     for sequence in GOOD_SEQUENCES:
         _ = StringSlice.from_utf8(Span(sequence))
 
-    for var sequence in BAD_SEQUENCES:
+    for sequence in BAD_SEQUENCES:
         with assert_raises(contains="buffer is not valid UTF-8"):
             _ = StringSlice.from_utf8(Span(sequence))
 

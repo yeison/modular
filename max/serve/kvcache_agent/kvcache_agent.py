@@ -17,6 +17,7 @@ import queue
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Any
 
 import grpc
 import zmq
@@ -32,7 +33,7 @@ from max.serve.kvcache_agent.kvcache_agent_service_v1_pb2_grpc import (
 )
 from max.serve.queue.zmq_queue import ZmqPullSocket
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("max.serve")
 
 
 @dataclass
@@ -60,9 +61,9 @@ class KVCacheAgentServerConfig:
 class KVCacheAgentServicer(KVCacheAgentServiceServicer):
     """Implementation of the KVCacheAgentService service."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the KVCacheAgentServicer."""
-        self._subscribers = set()
+        self._subscribers: set[Any] = set()
         self._cache_state: dict[MemoryTier, set[str]] = {}
         self._lock = threading.RLock()
 
@@ -89,7 +90,7 @@ class KVCacheAgentServicer(KVCacheAgentServiceServicer):
         with self._lock:
             # Send initial state with all existing entries
             if self._cache_state:
-                for memory_tier in self._cache_state.keys():
+                for memory_tier in self._cache_state:
                     if self._cache_state[memory_tier]:
                         initial_update = KVCacheStateUpdate(
                             update_type=UpdateType.UPDATE_TYPE_ADDED,
@@ -206,7 +207,7 @@ class KVCacheAgentServer:
         config: KVCacheAgentServerConfig,
         zmq_ctx: zmq.Context,
         kv_cache_events_zmq_endpoint: str,
-    ):
+    ) -> None:
         """
         Initialize the KVCacheAgentServer.
 
@@ -333,9 +334,7 @@ def start_kvcache_agent_service(
     """
 
     config = KVCacheAgentServerConfig(
-        host=host,
-        port=port,
-        num_workers=num_workers,
+        host=host, port=port, num_workers=num_workers
     )
     server = KVCacheAgentServer(config, zmq_ctx, kv_cache_events_zmq_endpoint)
     server.start()

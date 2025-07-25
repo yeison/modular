@@ -10,16 +10,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo-no-debug %s -t
-# NOTE: to test changes on the current branch using run-benchmarks.sh, remove
-# the -t flag. Remember to replace it again before pushing any code.
 
-from collections.string.string_slice import _memchr, _memmem
 from sys import simdwidthof
 
-from benchmark import Bench, BenchConfig, Bencher, BenchId, Unit, keep, run
-from bit import count_trailing_zeros
-from builtin.dtype import _uint_type_of_width
+from benchmark import Bench, BenchConfig, Bencher, BenchId
 
 # ===-----------------------------------------------------------------------===#
 # Benchmark Data

@@ -20,8 +20,8 @@ from typing import Callable
 
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, Weight, ops
+from max.nn.attention import MHAMaskVariant
 from max.nn.kernels import (
-    MHAMaskVariant,
     flash_attention_ragged,
     fused_qk_ragged_rope,
     fused_qkv_ragged_matmul,
@@ -34,7 +34,7 @@ from max.nn.kv_cache import (
 )
 from max.nn.layer import Module
 from max.nn.linear import Linear
-from max.nn.rotary_embedding import OptimizedRotaryEmbedding
+from max.nn.rotary_embedding import Llama3RotaryEmbedding
 from max.pipelines.architectures.gemma3.layers.rms_norm import Gemma3RMSNorm
 
 
@@ -44,8 +44,8 @@ class _Gemma3Attention(Module):
     def __init__(
         self,
         *,
-        rope_global: OptimizedRotaryEmbedding,
-        rope_local: OptimizedRotaryEmbedding,
+        rope_global: Llama3RotaryEmbedding,
+        rope_local: Llama3RotaryEmbedding,
         num_attention_heads: int,
         num_key_value_heads: int,
         hidden_size: int,
@@ -59,7 +59,7 @@ class _Gemma3Attention(Module):
         has_bias: bool = False,
         qk_norm_eps: float = 1e-6,
         local_window_size: int = 1024,
-    ):
+    ) -> None:
         """Initializes the attention layer.
 
         Args:
@@ -242,7 +242,7 @@ class _Gemma3Attention(Module):
         # Calculate Flash Attention.
         mask_variant = (
             MHAMaskVariant.SLIDING_WINDOW_CAUSAL_MASK
-            if bool((layer_idx + 1) % self.sliding_window_pattern)
+            if bool((self.layer_idx + 1) % self.sliding_window_pattern)
             else MHAMaskVariant.CAUSAL_MASK
         )
         attn_out = flash_attention_ragged(

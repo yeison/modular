@@ -10,9 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo %s
 
-from memory import AddressSpace, UnsafePointer
 from test_utils import (
     ExplicitCopyOnly,
     MoveCounter,
@@ -33,7 +31,10 @@ def test_unsafepointer_of_move_only_type():
     assert_equal(actions_ptr[0][1], "__moveinit__", msg="emplace_value")
     assert_equal(ptr[0].value, 42)
 
-    if True:  # scope value
+    # Stop compiler warnings
+    var true = True
+
+    if true:  # scope value
         var value = ptr.take_pointee()
         assert_equal(len(actions_ptr[0]), 3)
         assert_equal(actions_ptr[0][2], "__moveinit__")
@@ -197,7 +198,7 @@ def test_unsafepointer_aligned_alloc():
     assert_equal(ptr_uint64_3 % alignment_3, 0)
 
 
-# Test that `UnsafePointer.alloc()` no longer artifically extends the lifetime
+# Test that `UnsafePointer.alloc()` no longer artificially extends the lifetime
 # of every local variable in methods where its used.
 def test_unsafepointer_alloc_origin():
     # -----------------------------------------
@@ -206,7 +207,7 @@ def test_unsafepointer_alloc_origin():
 
     var did_del_1 = False
 
-    # Allocate pointer with MutableAnyOrgin.
+    # Allocate pointer with MutableAnyOrigin.
     var ptr_1 = (
         UnsafePointer[Int].alloc(1).origin_cast[origin=MutableAnyOrigin]()
     )

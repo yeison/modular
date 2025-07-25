@@ -25,12 +25,13 @@ from max.graph.quantization import QuantizationEncoding
 from max.nn import (
     MLP,
     AttentionWithRope,
+    AttentionWithRopeAndLoRA,
     Embedding,
     GGUFQAttentionWithRope,
     GPTQAttentionWithRope,
     GPTQLinear,
     Linear,
-    Llama3RotaryEmbedding,
+    LinearLoRA,
     Module,
     RMSNorm,
     Transformer,
@@ -42,7 +43,7 @@ from max.nn.kv_cache import (
     KVCacheStrategy,
 )
 
-from .model_config import Llama3Config
+from .model_config import Llama3Config, create_rope_embedding
 
 
 class StackedMLP(Module):
@@ -55,7 +56,7 @@ class StackedMLP(Module):
         devices: Sequence[DeviceRef],
         linear_cls: Callable[..., Linear],
         has_scale: bool = False,
-    ):
+    ) -> None:
         super().__init__()
         self.gate_up_proj = linear_cls(
             in_dim=hidden_dim,
@@ -92,11 +93,11 @@ class ConstantLayerNorm(Module):
 
     def __init__(
         self,
-        dims,
+        dims,  # noqa: ANN001
         device: DeviceRef,
         dtype: DType,
         eps: float = 1e-5,
-    ):
+    ) -> None:
         super().__init__()
         self.gamma = np.ones(dims)
         self.beta = np.zeros(dims)
@@ -119,15 +120,16 @@ class ConstantLayerNorm(Module):
 
 
 class Llama3(Transformer):
-    def __init__(self, config: Llama3Config):
+    def __init__(self, config: Llama3Config) -> None:
         assert len(config.devices) == 1
-        rope = Llama3RotaryEmbedding(
-            dim=config.hidden_size,
-            n_heads=config.num_attention_heads,
-            theta=config.rope_theta,
+        rope = create_rope_embedding(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            rope_theta=config.rope_theta,
             max_seq_len=config.max_seq_len,
-            interleaved=config.interleaved_rope_weights,
-            scaling_params=config.rope_scaling_params,
+            interleaved_rope_weights=config.interleaved_rope_weights,
+            rope_scaling_params=config.rope_scaling_params,
+            longrope_scaling_params=config.longrope_scaling_params,
             device=config.devices[0],
         )
 
@@ -158,6 +160,12 @@ class Llama3(Transformer):
         if config.quantization_config:
             linear_cls = functools.partial(
                 GPTQLinear, quantization_config=config.quantization_config
+            )
+        elif config.lora_config:
+            linear_cls = functools.partial(
+                LinearLoRA,
+                max_num_loras=config.lora_config.max_num_loras,
+                max_lora_rank=config.lora_config.max_lora_rank,
             )
         else:
             linear_cls = functools.partial(
@@ -190,6 +198,14 @@ class Llama3(Transformer):
                 GGUFQAttentionWithRope,
                 quantization_encoding=config.model_quantization_encoding,
                 scale=config.attention_multiplier,
+            )
+        elif config.lora_config:
+            attention_cls = functools.partial(
+                AttentionWithRopeAndLoRA,
+                stacked_qkv=config.stacked_qkv,
+                scale=config.attention_multiplier,
+                clip_qkv=config.clip_qkv,
+                has_bias=config.attention_bias,
             )
         else:
             attention_cls = functools.partial(

@@ -19,8 +19,6 @@ from memory import OwnedPointer
 ```
 """
 
-from memory import UnsafePointer, memcpy
-
 
 @register_passable
 struct OwnedPointer[T: AnyType]:
@@ -44,7 +42,7 @@ struct OwnedPointer[T: AnyType]:
     # Life cycle methods
     # ===-------------------------------------------------------------------===#
 
-    fn __init__[T: Movable](out self: OwnedPointer[T], owned value: T):
+    fn __init__[T: Movable](out self: OwnedPointer[T], var value: T):
         """Construct a new `OwnedPointer` by moving the passed value into a new backing allocation.
 
         Parameters:
@@ -135,7 +133,7 @@ struct OwnedPointer[T: AnyType]:
         """
         return self._inner
 
-    fn take[T: Movable](owned self: OwnedPointer[T]) -> T:
+    fn take[T: Movable](var self: OwnedPointer[T]) -> T:
         """Move the value within the `OwnedPointer` out of it, consuming the
         `OwnedPointer` in the process.
 
@@ -154,7 +152,7 @@ struct OwnedPointer[T: AnyType]:
 
         return r^
 
-    fn steal_data(owned self) -> UnsafePointer[T]:
+    fn steal_data(var self) -> UnsafePointer[T]:
         """Take ownership over the heap allocated pointer backing this
         `OwnedPointer`.
 

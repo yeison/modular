@@ -10,17 +10,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo %s
 
 from sys.info import sizeof
 
-from memory import Span, UnsafePointer
 from test_utils import (
     CopyCountedStruct,
     CopyCounter,
     DelCounter,
     MoveCounter,
-    g_dtor_count,
 )
 from testing import (
     assert_equal,
@@ -73,7 +70,7 @@ def test_list():
 
 
 struct WeirdList[T: AnyType]:
-    fn __init__(out self, owned *values: T, __list_literal__: ()):
+    fn __init__(out self, var *values: T, __list_literal__: ()):
         pass
 
 
@@ -254,7 +251,7 @@ def test_list_reverse():
     # Test reversing the list ["one", "two", "three"]
     #
 
-    vec2 = [String("one"), "two", "three"]
+    vec2 = ["one", "two", "three"]
 
     assert_equal(len(vec2), 3)
     assert_equal(vec2[0], "one")
@@ -297,26 +294,26 @@ def test_list_reverse_move_count():
     vec.append(MoveCounter(5))
 
     assert_equal(len(vec), 5)
-    assert_equal(vec.data[0].value, 1)
-    assert_equal(vec.data[1].value, 2)
-    assert_equal(vec.data[2].value, 3)
-    assert_equal(vec.data[3].value, 4)
-    assert_equal(vec.data[4].value, 5)
+    assert_equal(vec[0].value, 1)
+    assert_equal(vec[1].value, 2)
+    assert_equal(vec[2].value, 3)
+    assert_equal(vec[3].value, 4)
+    assert_equal(vec[4].value, 5)
 
-    assert_equal(vec.data[0].move_count, 1)
-    assert_equal(vec.data[1].move_count, 1)
-    assert_equal(vec.data[2].move_count, 1)
-    assert_equal(vec.data[3].move_count, 1)
-    assert_equal(vec.data[4].move_count, 1)
+    assert_equal(vec[0].move_count, 1)
+    assert_equal(vec[1].move_count, 1)
+    assert_equal(vec[2].move_count, 1)
+    assert_equal(vec[3].move_count, 1)
+    assert_equal(vec[4].move_count, 1)
 
     vec.reverse()
 
     assert_equal(len(vec), 5)
-    assert_equal(vec.data[0].value, 5)
-    assert_equal(vec.data[1].value, 4)
-    assert_equal(vec.data[2].value, 3)
-    assert_equal(vec.data[3].value, 2)
-    assert_equal(vec.data[4].value, 1)
+    assert_equal(vec[0].value, 5)
+    assert_equal(vec[1].value, 4)
+    assert_equal(vec[2].value, 3)
+    assert_equal(vec[3].value, 2)
+    assert_equal(vec[4].value, 1)
 
     # NOTE:
     # Earlier elements went through 2 moves and later elements went through 3
@@ -325,11 +322,11 @@ def test_list_reverse_move_count():
     # earlier element to a temporary (+1 move), directly move the later element
     # into the position the earlier element was in, and then move from the
     # temporary into the later position (+1 move).
-    assert_equal(vec.data[0].move_count, 2)
-    assert_equal(vec.data[1].move_count, 2)
-    assert_equal(vec.data[2].move_count, 1)
-    assert_equal(vec.data[3].move_count, 3)
-    assert_equal(vec.data[4].move_count, 3)
+    assert_equal(vec[0].move_count, 2)
+    assert_equal(vec[1].move_count, 2)
+    assert_equal(vec[2].move_count, 1)
+    assert_equal(vec[3].move_count, 3)
+    assert_equal(vec[4].move_count, 3)
 
 
 def test_list_insert():
@@ -532,11 +529,11 @@ def test_list_extend_non_trivial():
     assert_equal(v1[3].value, "Bar")
     assert_equal(v1[4].value, "Baz")
 
-    assert_equal(v1.data[0].move_count, 1)
-    assert_equal(v1.data[1].move_count, 1)
-    assert_equal(v1.data[2].move_count, 2)
-    assert_equal(v1.data[3].move_count, 2)
-    assert_equal(v1.data[4].move_count, 2)
+    assert_equal(v1[0].move_count, 1)
+    assert_equal(v1[1].move_count, 1)
+    assert_equal(v1[2].move_count, 2)
+    assert_equal(v1[3].move_count, 2)
+    assert_equal(v1[4].move_count, 2)
 
 
 def test_2d_dynamic_list():
@@ -743,7 +740,7 @@ def test_converting_list_to_string():
     var my_list = [1, 2, 3]
     assert_equal(my_list.__str__(), "[1, 2, 3]")
 
-    var my_list4 = [String("a"), "b", "c", "foo"]
+    var my_list4 = ["a", "b", "c", "foo"]
     assert_equal(my_list4.__str__(), "['a', 'b', 'c', 'foo']")
 
 
@@ -837,9 +834,9 @@ def test_list_eq_ne():
     assert_true(l4 == l5)
     assert_true(l1 != l4)
 
-    var l6 = [String("a"), "b", "c"]
-    var l7 = [String("a"), "b", "c"]
-    var l8 = [String("a"), "b"]
+    var l6 = ["a", "b", "c"]
+    var l7 = ["a", "b", "c"]
+    var l8 = ["a", "b"]
     assert_true(l6 == l7)
     assert_false(l6 != l7)
     assert_false(l6 == l8)
@@ -866,39 +863,29 @@ def test_indexing():
 # ===-------------------------------------------------------------------===#
 
 
-def inner_test_list_dtor():
-    # explicitly reset global counter
-    g_dtor_count = 0
+def test_list_dtor():
+    var dtor_count = 0
 
     var l = List[DelCounter]()
-    assert_equal(g_dtor_count, 0)
+    assert_equal(dtor_count, 0)
 
-    l.append(DelCounter())
-    assert_equal(g_dtor_count, 0)
+    l.append(DelCounter(UnsafePointer(to=dtor_count)))
+    assert_equal(dtor_count, 0)
 
     l^.__del__()
-    assert_equal(g_dtor_count, 1)
-
-
-def test_list_dtor():
-    # call another function to force the destruction of the list
-    inner_test_list_dtor()
-
-    # verify we still only ran the destructor once
-    assert_equal(g_dtor_count, 1)
+    assert_equal(dtor_count, 1)
 
 
 # Verify we skip calling destructors for the trivial elements
 def test_destructor_trivial_elements():
-    # explicitly reset global counter
-    g_dtor_count = 0
+    var dtor_count = 0
 
     var l = List[DelCounter, hint_trivial_type=True]()
-    l.append(DelCounter())
+    l.append(DelCounter(UnsafePointer(to=dtor_count)))
 
     l^.__del__()
 
-    assert_equal(g_dtor_count, 0)
+    assert_equal(dtor_count, 0)
 
 
 def test_list_repr():
@@ -953,7 +940,7 @@ def _test_copyinit_trivial_types[dt: DType, hint_trivial_type: Bool]():
         y = x
         assert_equal(test_current_size, current_size)
         assert_equal(len(y), current_size)
-        assert_not_equal(x.data, y.data)
+        assert_not_equal(Int(x.unsafe_ptr()), Int(y.unsafe_ptr()))
         for i in range(current_size):
             assert_equal(i, x[i])
             assert_equal(y[i], x[i])

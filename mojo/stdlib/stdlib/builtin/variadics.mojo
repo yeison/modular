@@ -15,7 +15,7 @@
 These are Mojo built-ins, so you don't need to import them.
 """
 
-from memory import Pointer, UnsafePointer
+from memory import Pointer
 
 # ===-----------------------------------------------------------------------===#
 # VariadicList / VariadicListMem
@@ -23,33 +23,63 @@ from memory import Pointer, UnsafePointer
 
 
 @fieldwise_init
-struct _VariadicListIter[type: AnyTrivialRegType](Copyable, Movable):
+struct _VariadicListIter[type: AnyTrivialRegType](Copyable, Iterator, Movable):
     """Const Iterator for VariadicList.
 
     Parameters:
         type: The type of the elements in the list.
     """
 
+    alias Element = type
+
     var index: Int
     var src: VariadicList[type]
+
+    @always_inline
+    fn __has_next__(self) -> Bool:
+        return self.index < len(self.src)
 
     fn __next__(mut self) -> type:
         self.index += 1
         return self.src[self.index - 1]
 
-    @always_inline
-    fn __has_next__(self) -> Bool:
-        return self.__len__() > 0
-
-    fn __len__(self) -> Int:
-        return len(self.src) - self.index
-
 
 @register_passable("trivial")
 struct VariadicList[type: AnyTrivialRegType](Sized):
-    """A utility class to access variadic function arguments. Provides a "list"
-    view of the function argument so that the size of the argument list and each
-    individual argument can be accessed.
+    """A utility class to access homogeneous variadic function arguments.
+
+    `VariadicList` is used when you need to accept variadic arguments where all
+    arguments have the same type. Unlike `VariadicPack` (which is heterogeneous),
+    `VariadicList` requires all elements to have the same concrete type.
+
+    At runtime, `VariadicList` is treated as a homogeneous array. Because all
+    the elements have the same type, each element has the same size and memory
+    layout, so the compiler can generate code that works to access any index
+    at runtime.
+
+    Therefore, indexing into `VariadicList` can use runtime indices with regular
+    `for` loops, whereas indexing into `VariadicPack` requires compile-time
+    indices using `@parameter for` loops.
+
+    For example, in the following function signature, `*args: Int` creates a
+    `VariadicList` because it uses a single type `Int` instead of a variadic type
+    parameter. The `*` before `args` indicates that `args` is a variadic argument,
+    which means that the function can accept any number of arguments, but all
+    arguments must have the same type `Int`.
+
+    ```mojo
+    fn sum_values(*args: Int) -> Int:
+        var total = 0
+
+        # Can use regular for loop because args is a VariadicList
+        for i in range(len(args)):
+            total += args[i]  # All elements are Int, so uniform access
+
+        return total
+
+    def main():
+        print(sum_values(1, 2, 3, 4, 5))
+    ```
 
     Parameters:
         type: The type of the elements in the list.
@@ -133,12 +163,15 @@ struct _VariadicListMemIter[
         elt_type: The type of the elements in the list.
         elt_origin: The origin of the elements.
         list_origin: The origin of the VariadicListMem.
-        is_owned: Whether the elements are owned by the list.
+        is_owned: Whether the elements are owned by the list because they are
+                  passed as an 'var' argument.
     """
 
     alias variadic_list_type = VariadicListMem[
         elt_type, elt_origin._mlir_origin, is_owned
     ]
+
+    alias Element = elt_type
 
     var index: Int
     var src: Pointer[
@@ -152,18 +185,15 @@ struct _VariadicListMemIter[
         self.index = index
         self.src = Pointer(to=list)
 
-    fn __next__(mut self) -> ref [elt_origin] elt_type:
+    @always_inline
+    fn __has_next__(self) -> Bool:
+        return self.index < len(self.src[])
+
+    fn __next_ref__(mut self) -> ref [elt_origin] elt_type:
         self.index += 1
         return rebind[Self.variadic_list_type.reference_type](
             Pointer(to=self.src[][self.index - 1])
         )[]
-
-    @always_inline
-    fn __has_next__(self) -> Bool:
-        return self.__len__() > 0
-
-    fn __len__(self) -> Int:
-        return len(self.src[]) - self.index
 
 
 struct VariadicListMem[
@@ -181,7 +211,8 @@ struct VariadicListMem[
                         mut or owned argument.
         element_type: The type of the elements in the list.
         origin: The origin of the underlying elements.
-        is_owned: Whether the elements are owned by the list.
+        is_owned: Whether the elements are owned by the list because they are
+                  passed as an 'var' argument.
     """
 
     alias reference_type = Pointer[element_type, origin]
@@ -253,9 +284,7 @@ struct VariadicListMem[
         # cast mutability of self to match the mutability of the element,
         # since that is what we want to use in the ultimate reference and
         # the union overall doesn't matter.
-        Origin[elt_is_mutable]
-        .cast_from[__origin_of(origin, self)]
-        .result
+        Origin[elt_is_mutable].cast_from[__origin_of(origin, self)]
     ] element_type:
         """Gets a single element on the variadic list.
 
@@ -300,8 +329,47 @@ struct VariadicPack[
     element_trait: _AnyTypeMetaType,
     *element_types: element_trait,
 ](Sized):
-    """A utility class to access variadic pack  arguments and provide an API for
-    doing things with them.
+    """A utility class to access heterogeneous variadic function arguments.
+
+    `VariadicPack` is used when you need to accept variadic arguments where each
+    argument can have a different type, but all types conform to a common trait.
+    Unlike `VariadicList` (which is homogeneous), `VariadicPack` allows each
+    element to have a different concrete type.
+
+    `VariadicPack` is essentially a heterogeneous tuple that gets lowered to a
+    struct at runtime. Because `VariadicPack` is a heterogeneous tuple (not an
+    array), each element can have a different size and memory layout, which
+    means the compiler needs to know the exact type of each element at compile
+    time to generate the correct memory layout and access code.
+
+    Therefore, indexing into `VariadicPack` requires compile-time indices using
+    `@parameter for` loops, whereas indexing into `VariadicList` uses runtime
+    indices.
+
+    For example, in the following function signature, `*args: *ArgTypes` creates a
+    `VariadicPack` because it uses a variadic type parameter `*ArgTypes` instead
+    of a single type. The `*` before `ArgTypes` indicates that `ArgTypes` is a
+    variadic type parameter, which means that the function can accept any number
+    of arguments, and each argument can have a different type. This allows each
+    argument to have a different type while all types must conform to the
+    `Intable` trait.
+
+    ```mojo
+    fn count_many_things[*ArgTypes: Intable](*args: *ArgTypes) -> Int:
+        var total = 0
+
+        # Must use @parameter for loop because args is a VariadicPack
+        @parameter
+        for i in range(args.__len__()):
+            # Each args[i] has a different concrete type from *ArgTypes
+            # The compiler generates specific code for each iteration
+            total += Int(args[i])
+
+        return total
+
+    def main():
+        print(count_many_things(5, 11.7, 12))  # Prints: 28
+    ```
 
     Parameters:
         elt_is_mutable: True if the elements of the list are mutable for an
@@ -331,6 +399,10 @@ struct VariadicPack[
 
     @doc_private
     @always_inline("nodebug")
+    # This disables nested origin exclusivity checking because it is taking a
+    # raw variadic pack which can have nested origins in it (which this does not
+    # dereference).
+    @__unsafe_disable_nested_origin_exclusivity
     fn __init__(out self, value: Self._mlir_type):
         """Constructs a VariadicPack from the internal representation.
 

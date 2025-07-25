@@ -24,14 +24,13 @@ import sys
 from pathlib import Path
 
 from memory import Span
-
-from utils import write_buffered
+from utils.write import _WriteBufferStack
 
 alias TMP_MAX = 10_000
 
 
 fn _get_random_name(size: Int = 8) -> String:
-    alias characters = String("abcdefghijklmnopqrstuvwxyz0123456789_")
+    alias characters = "abcdefghijklmnopqrstuvwxyz0123456789_"
     var name = String(capacity=size)
     for _ in range(size):
         var rand_index = Int(
@@ -52,12 +51,12 @@ fn _candidate_tempdir_list() -> List[String]:
     var dirname: String
 
     # First, try the environment.
-    for ref env_var in possible_env_vars:
+    for env_var in possible_env_vars:
         if dirname := os.getenv(String(env_var)):
             dirlist.append(dirname^)
 
     # Failing that, try OS-specific locations.
-    dirlist.extend([String("/tmp"), String("/var/tmp"), String("/usr/tmp")])
+    dirlist.extend(["/tmp", "/var/tmp", "/usr/tmp"])
 
     # As a last resort, the current directory if possible,
     # os.path.getcwd() could raise
@@ -79,7 +78,7 @@ fn _get_default_tempdir() raises -> String:
 
     var dirlist = _candidate_tempdir_list()
 
-    for ref dir_name in dirlist:
+    for dir_name in dirlist:
         if not os.path.isdir(dir_name):
             continue
         if _try_to_create_file(dir_name):
@@ -180,7 +179,7 @@ fn _rmtree(path: String, ignore_errors: Bool = False) raises:
     if os.path.islink(path):
         raise Error("`path`can not be a symbolic link: " + path)
 
-    for ref file_or_dir in os.listdir(path):
+    for file_or_dir in os.listdir(path):
         var curr_path = os.path.join(path, file_or_dir)
         if os.path.isfile(curr_path):
             try:
@@ -415,7 +414,13 @@ struct NamedTemporaryFile:
             args: Sequence of arguments to write to this Writer.
         """
         var file = FileDescriptor(self._file_handle._get_raw_fd())
-        write_buffered(file, args)
+        var buffer = _WriteBufferStack(file)
+
+        @parameter
+        for i in range(args.__len__()):
+            args[i].write_to(buffer)
+
+        buffer.flush()
 
     @always_inline
     fn write_bytes(mut self, bytes: Span[Byte, _]):
@@ -427,7 +432,7 @@ struct NamedTemporaryFile:
         """
         self._file_handle.write_bytes(bytes)
 
-    fn __enter__(owned self) -> Self:
+    fn __enter__(var self) -> Self:
         """The function to call when entering the context.
 
         Returns:

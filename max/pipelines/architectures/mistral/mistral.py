@@ -20,8 +20,8 @@ from max.nn import (
     AttentionWithRope,
     Embedding,
     Linear,
-    OptimizedRotaryEmbedding,
     RMSNorm,
+    RotaryEmbedding,
     Transformer,
     TransformerBlock,
 )
@@ -37,11 +37,11 @@ from .model_config import MistralConfig
 class Mistral(Transformer):
     """Defines the Mistral transformer model."""
 
-    def __init__(self, config: MistralConfig):
+    def __init__(self, config: MistralConfig) -> None:
         assert len(config.devices) == 1
 
         # hidden_size (5120) != num_attention_heads * head_dim (128 * 40 = 4,096)
-        rope = OptimizedRotaryEmbedding(
+        rope = RotaryEmbedding(
             dim=config.hidden_size,
             n_heads=config.num_attention_heads,
             head_dim=config.head_dim,

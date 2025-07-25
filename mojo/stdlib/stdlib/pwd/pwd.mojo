@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from sys import os_is_linux, os_is_macos, os_is_windows
+from sys import os_is_macos, os_is_windows
 
 # ===----------------------------------------------------------------------=== #
 # Passwd
@@ -21,7 +21,7 @@ from ._macos import _getpw_macos
 
 
 @fieldwise_init
-struct Passwd(Stringable, Writable, Copyable, Movable):
+struct Passwd(Copyable, Movable, Stringable, Writable):
     """Represents user account information retrieved from the user password
     database related to a user ID."""
 
@@ -107,7 +107,7 @@ fn getpwuid(uid: Int) raises -> Passwd:
         return _getpw_linux(UInt32(uid))
 
 
-fn getpwnam(owned name: String) raises -> Passwd:
+fn getpwnam(var name: String) raises -> Passwd:
     """
     Retrieves the user ID in the password database for the given user name.
 

@@ -22,7 +22,7 @@ from sys.info import _has_blackwell_tcgen05
 
 from gpu.memory import AddressSpace, external_memory
 from gpu.mma import _str_iota  # TODO: move to a string module
-from memory import UnsafePointer, bitcast
+from memory import bitcast
 
 from gpu.mma_sm100 import MMASmemDescriptor
 
@@ -132,19 +132,19 @@ fn tcgen05_ld[
     datapaths: Int,
     bits: Int,
     repeat: Int,
-    type: DType,
+    dtype: DType,
     pack: Bool,
     width: Int = (datapaths * bits * repeat) // (32 * 32),
-](tmem_addr: UInt32) -> SIMD[type, width]:
+](tmem_addr: UInt32) -> SIMD[dtype, width]:
     """Loads data from tensor memory into registers.
 
     Parameters:
         datapaths: The first dimension of the shape.
         bits: The second dimension of the shape.
         repeat: The repeat factor.
-        type: The data type to load.
+        dtype: The data type to load.
         pack: Whether to pack two 16-bit chunks of adjacent columns into a single 32-bit register.
-        width: The nubmer elements in the result vector.
+        width: The number elements in the result vector.
 
     Args:
         tmem_addr: The address of the tensor memory to load from.
@@ -159,7 +159,11 @@ fn tcgen05_ld[
         or (datapaths == 16 and bits == 128)
         or (datapaths == 16 and bits == 256)
         or (datapaths == 32 and bits == 32),
-        "`datapaths`x`bits`b must be 16x64b, 16x128b, 16x256b or 32x32b.",
+        "`datapaths`x`bits`b must be 16x64b, 16x128b, 16x256b or 32x32b, got "
+        + String(datapaths)
+        + "x"
+        + String(bits)
+        + "b.",
     ]()
 
     constrained[
@@ -174,7 +178,7 @@ fn tcgen05_ld[
 
     constrained[
         width == (repeat * bits * datapaths) // (32 * 32)
-        and sizeof[type]() == 4,
+        and sizeof[dtype]() == 4,
         String(
             (
                 "Only support 4B data type and width must be equal to (num * n"
@@ -195,7 +199,7 @@ fn tcgen05_ld[
 
     @parameter
     @always_inline
-    fn call_ld_intrinsic[pack_type: AnyTrivialRegType]() -> SIMD[type, width]:
+    fn call_ld_intrinsic[pack_type: AnyTrivialRegType]() -> SIMD[dtype, width]:
         var r = inlined_assembly[
             "tcgen05.ld.sync.aligned."
             + shape_str
@@ -211,7 +215,7 @@ fn tcgen05_ld[
             constraints=constraints_str,
             has_side_effect=True,
         ](tmem_addr)
-        return UnsafePointer(to=r).bitcast[SIMD[type, width]]()[]
+        return UnsafePointer(to=r).bitcast[SIMD[dtype, width]]()[]
 
     # fmt: off
     @parameter
@@ -279,23 +283,23 @@ fn tcgen05_ld[
         ]()
     else:
         constrained[False, "width must be a power of 2 in the range [1, 128]."]()
-        return abort[SIMD[type, width]]()
+        return abort[SIMD[dtype, width]]()
     # fmt: on
 
 
 fn tcgen05_st[
-    type: DType,
+    dtype: DType,
     width: Int, //,
     *,
     datapaths: Int,
     bits: Int,
     repeat: Int,
     pack: Bool,
-](tmem_addr: UInt32, data: SIMD[type, width]):
+](tmem_addr: UInt32, data: SIMD[dtype, width]):
     """Stores data from registers into tensor memory.
 
     Parameters:
-        type: The data type to load.
+        dtype: The data type to store.
         width: The number of elements in the data vector.
         datapaths: The first dimension of the shape.
         bits: The second dimension of the shape.
@@ -328,7 +332,7 @@ fn tcgen05_st[
 
     constrained[
         width == (repeat * bits * datapaths) // (32 * 32)
-        and sizeof[type]() == 4,
+        and sizeof[dtype]() == 4,
         (
             "Only support 4B data type and width must be equal to (num * n"
             " * m) // (32 * 32)."
@@ -337,7 +341,7 @@ fn tcgen05_st[
 
     alias shape_str = String(datapaths) + "x" + String(bits)
     alias num_str = String(repeat)
-    alias pack_str = ".pack::16b" if pack else ""
+    alias pack_str = ".unpack::16b" if pack else ""
     alias constraints_str = "r," * width + "r"
     alias addr_str = "[$" + String(width) + "]"
     alias input_args_str = "{" + _str_iota[width, prefix="$", sep=","]() + "}"
@@ -385,6 +389,17 @@ fn tcgen05_st[
             data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
             data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
             tmem_addr)
+    elif width == 64:
+        inlined_assembly[asm_str, NoneType, constraints=constraints_str, has_side_effect=True](
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+            data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
+            data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
+            data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
+            data[40], data[41], data[42], data[43], data[44], data[45], data[46], data[47],
+            data[48], data[49], data[50], data[51], data[52], data[53], data[54], data[55],
+            data[56], data[57], data[58], data[59], data[60], data[61], data[62], data[63],
+            tmem_addr)
     else:
         inlined_assembly[asm_str, NoneType, constraints=constraints_str, has_side_effect=True](
             data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -395,6 +410,14 @@ fn tcgen05_st[
             data[40], data[41], data[42], data[43], data[44], data[45], data[46], data[47],
             data[48], data[49], data[50], data[51], data[52], data[53], data[54], data[55],
             data[56], data[57], data[58], data[59], data[60], data[61], data[62], data[63],
+            data[64], data[65], data[66], data[67], data[68], data[69], data[70], data[71], 
+            data[72], data[73], data[74], data[75], data[76], data[77], data[78], data[79], 
+            data[80], data[81], data[82], data[83], data[84], data[85], data[86], data[87], 
+            data[88], data[89], data[90], data[91], data[92], data[93], data[94], data[95], 
+            data[96], data[97], data[98], data[99], data[100], data[101], data[102], data[103], 
+            data[104], data[105], data[106], data[107], data[108], data[109], data[110], data[111], 
+            data[112], data[113], data[114], data[115], data[116], data[117], data[118], data[119], 
+            data[120], data[121], data[122], data[123], data[124], data[125], data[126], data[127],
             tmem_addr)
     # fmt: on
 

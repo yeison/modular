@@ -1,5 +1,5 @@
 # ===----------------------------------------------------------------------=== #
-# Copyright (c) 2024, Modular Inc. All rights reserved.
+# Copyright (c) 2025, Modular Inc. All rights reserved.
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions:
 # https://llvm.org/LICENSE.txt
@@ -10,7 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %bare-mojo %s
 
 from testing import assert_equal
 from bit._mask import is_negative, is_true
@@ -37,7 +36,7 @@ def test_is_negative():
         for j in range(len(widths)):
             alias S = SIMD[D, widths[j]]
 
-            for var k in values:
+            for k in values:
                 assert_equal(S(-1), is_negative(S(-k)))
                 assert_equal(S(0), is_negative(S(k)))
 
@@ -88,7 +87,7 @@ def test_compare():
         for j in range(len(widths)):
             alias S = SIMD[D, widths[j]]
 
-            for var k in values:
+            for k in values:
                 var s_k = S(k)
                 var s_k_1 = S(k - 1)
                 assert_equal(S(-1), is_true[D](s_k == s_k))

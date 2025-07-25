@@ -17,10 +17,8 @@ from os import abort
 from sys import sizeof
 from sys.info import alignof, simdwidthof
 
-import layout.runtime_tuple
-from buffer import NDBuffer
-from buffer.dimlist import Dim, DimList
-from builtin.io import _printf
+from buffer.dimlist import Dim
+from io.io import _printf
 from gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     WARP_SIZE,
@@ -33,30 +31,25 @@ from gpu import (
 from gpu.host import DeviceContext, FuncAttribute
 from gpu.memory import (
     AddressSpace,
-    async_copy_commit_group,
-    async_copy_wait_all,
-    async_copy_wait_group,
     external_memory,
 )
 from layout import Layout, LayoutTensor
-from layout._fillers import arange
 from layout._utils import ManagedLayoutTensor
 from layout.int_tuple import UNKNOWN_VALUE
 from layout.layout import size
 from layout.layout_tensor import (
     LayoutTensorIter,
-    copy,
-    copy_dram_to_sram_async,
+    copy_local_to_shared,
     copy_local_to_dram,
     copy_sram_to_dram,
 )
 from layout.swizzle import make_swizzle
 from layout.tensor_builder import LayoutTensorBuild as tb
-from layout.tensor_core import TensorCore, get_fragment_size, get_mma_shape
+from layout.tensor_core import get_fragment_size, get_mma_shape
 from linalg._multistage_gemm_gpu import multistage_mma
 from linalg.utils import elementwise_epilogue_type
-from linalg.utils_gpu import MatmulConfig, block_swizzle
-from testing import assert_almost_equal, assert_false
+from linalg.utils_gpu import block_swizzle
+from testing import assert_almost_equal
 
 from utils import StaticTuple
 from utils.index import Index, IndexList
@@ -439,7 +432,7 @@ fn b2b_gemm[
             d_reg_tile,
             ab_iter,
             c_gmem_iter,
-            a_smem_iter,  # ingored
+            a_smem_iter,  # ignored
             c_smem_iter,
             ceildiv(N, BK),
             num_b_rows=num_rows_b,
@@ -470,7 +463,10 @@ fn b2b_gemm[
             .view(a_smem.bitcast[Scalar[accum_type]]() + warp_id * WM * WN)
         )
 
-        copy[thread_layout = Layout.row_major(8, 4), swizzle=swizzle,](
+        copy_local_to_shared[
+            thread_layout = Layout.row_major(8, 4),
+            swizzle=swizzle,
+        ](
             accum_smem_warp_tile.vectorize[1, 2](),
             d_reg_tile.vectorize[1, 2]().transpose(),
         )
@@ -514,7 +510,6 @@ fn b2b_gemm[
                 )
 
                 alias dst_static_idx = __type_of(d_gmem_frag).layout(i)
-                var dst_idx = 0
 
                 @parameter
                 if d_layout.all_dims_known():
@@ -558,7 +553,6 @@ fn b2b_gemm[
             for i in range(__type_of(d_gmem_frag).layout.size()):
                 alias src_idx = d_reg_frag.layout(i)
                 alias dst_static_idx: UInt = __type_of(d_gmem_frag).layout(i)
-                var dst_idx = 0
 
                 @parameter
                 if d_layout.all_dims_known():

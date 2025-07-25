@@ -27,10 +27,10 @@ from max.graph import (
     Weight,
     ops,
 )
+from max.nn.attention import MHAMaskVariant
 from max.nn.attention.attention_with_rope import distribute_value
 from max.nn.comm import Allreduce
 from max.nn.kernels import (
-    MHAMaskVariant,
     flash_attention_ragged,
     fused_qk_ragged_rope,
     fused_qkv_ragged_matmul,
@@ -43,7 +43,7 @@ from max.nn.kv_cache import (
 )
 from max.nn.layer import Module
 from max.nn.linear import Linear
-from max.nn.rotary_embedding import OptimizedRotaryEmbedding
+from max.nn.rotary_embedding import RotaryEmbedding
 
 from .norm import l2_norm
 
@@ -63,7 +63,7 @@ class _Llama4TextAttention(Module):
     def __init__(
         self,
         *,
-        rope: OptimizedRotaryEmbedding,
+        rope: RotaryEmbedding,
         num_attention_heads: int,
         num_key_value_heads: int,
         hidden_size: int,
@@ -81,7 +81,7 @@ class _Llama4TextAttention(Module):
         use_qk_norm: bool = False,
         qk_norm_eps: float = 1e-6,
         local_window_size: int = 8192,
-    ):
+    ) -> None:
         """Initializes the attention layer.
 
         Args:
@@ -236,11 +236,9 @@ class _Llama4TextAttention(Module):
 
         if self.use_rope:
             if xq.device is not None:
-                freqs_cis = ops.cast(self.rope.freqs_cis, xq.dtype).to(
-                    xq.device
-                )
+                freqs_cis = self.rope.freqs_cis.to(xq.device)
             else:
-                freqs_cis = ops.cast(self.rope.freqs_cis, xq.dtype)
+                freqs_cis = self.rope.freqs_cis
             xq = fused_qk_ragged_rope(
                 self.kv_params,
                 xq,
@@ -253,7 +251,7 @@ class _Llama4TextAttention(Module):
 
         if self.use_qk_norm:
             # Apply QK norm to query and key states.
-            xq = l2_norm(xq)
+            xq = l2_norm(xq, self.qk_norm_eps, multiply_before_cast=False)
             rms_norm_key_cache(
                 self.kv_params,
                 kv_collection=kv_collection,
@@ -308,7 +306,7 @@ class _Llama4TextAttention(Module):
 class _DistributedLlama4TextAttention(_Llama4TextAttention):
     """Distributed implementation of the Llama4 text attention layer."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         if not self.devices or len(self.devices) < 2:
             raise ValueError(
@@ -318,10 +316,10 @@ class _DistributedLlama4TextAttention(_Llama4TextAttention):
         num_devices = len(self.devices)
         self.allreduce = Allreduce(num_devices)
 
-        self.q_proj.set_sharding_strategy(ShardingStrategy.rowwise(num_devices))
-        self.k_proj.set_sharding_strategy(ShardingStrategy.rowwise(num_devices))
-        self.v_proj.set_sharding_strategy(ShardingStrategy.rowwise(num_devices))
-        self.o_proj.set_sharding(ShardingStrategy.columnwise(num_devices))
+        self.q_proj.sharding_strategy = ShardingStrategy.rowwise(num_devices)
+        self.k_proj.sharding_strategy = ShardingStrategy.rowwise(num_devices)
+        self.v_proj.sharding_strategy = ShardingStrategy.rowwise(num_devices)
+        self.o_proj.sharding_strategy = ShardingStrategy.columnwise(num_devices)
 
         self.list_of_attentions = []
         kwargs = kwargs.copy()

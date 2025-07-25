@@ -17,22 +17,68 @@ import difflib
 import threading
 from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from functools import wraps
 from inspect import signature
-from typing import Any, Callable, Union, get_args
+from itertools import islice
+from typing import Any, Callable, Protocol, Union, get_args
 
 import numpy as np
 from max._core_types.driver import DLPackArray
 from max.driver import Tensor
 from max.dtype import DType
-from max.graph import Shape, ShapeLike, Weight
+from max.graph import (
+    DeviceRef,
+    Graph,
+    Shape,
+    ShapeLike,
+    ShardingStrategy,
+    StaticDim,
+    Type,
+    Value,
+    Weight,
+)
 from max.graph.quantization import QuantizationEncoding
 from max.graph.weights import WeightData
 
 from .._identity import IdentitySet
 
 DLPackCompatible = Union[DLPackArray, np.ndarray]
+
+
+class Shardable(Protocol):
+    """Protocol for objects that support sharding across multiple devices.
+
+    This protocol defines the interface that all shardable components
+    (like Linear layers and Weight objects) must implement to participate
+    in distributed computation.
+    """
+
+    @property
+    def sharding_strategy(self) -> ShardingStrategy | None:
+        """Gets the weight sharding strategy."""
+        ...
+
+    @sharding_strategy.setter
+    def sharding_strategy(self, strategy: ShardingStrategy) -> None:
+        """Sets the weight sharding strategy.
+
+        Args:
+            strategy: A ShardingStrategy that defines how to shard the weight.
+        """
+        ...
+
+    def shard(self, shard_idx: int, device: DeviceRef) -> Shardable:
+        """Creates a sharded view of this object for a specific device.
+
+        Args:
+            shard_idx: The index of the shard (0 to num_devices-1).
+            device: The device where this shard should reside.
+
+        Returns:
+            A sharded instance of this object.
+        """
+        ...
 
 
 class Layer:
@@ -54,7 +100,7 @@ class Layer:
         # Check `__dict__` instead of `hasattr` because `hasattr` passes on
         # subclasses that don't implement the method.
         if "__call__" in cls.__dict__:
-            setattr(cls, "__call__", _call_with_hooks(cls.__dict__["__call__"]))
+            setattr(cls, "__call__", _call_with_hooks(cls.__dict__["__call__"]))  # noqa: B010
 
     def __call__(self, *args, **kwargs):
         """Defines the forward function of this layer.
@@ -106,7 +152,7 @@ class Module(Layer, ABC):
     the weight names to be unique within the model.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         # `__init__` may be called if `__setattr__` is called before
         # `super().__init__()`. So, to avoid resetting the values, first
         # check to see if the layer has been initialized before.
@@ -116,7 +162,7 @@ class Module(Layer, ABC):
             self._weight_values: dict[str, DLPackCompatible] = {}
             self._shared_weights: dict[str, Weight] = {}
 
-    def __setattr__(self, name, value):
+    def __setattr__(self, name, value) -> None:  # noqa: ANN001
         try:
             if isinstance(value, Module):
                 self._sublayers[name] = value
@@ -138,7 +184,7 @@ class Module(Layer, ABC):
             return
         super().__setattr__(name, value)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         # TODO: Make this pretty
         return f"{type(self).__name__}({len(self.sublayers)} layers, {len(self.layer_weights)} weights)"
 
@@ -146,15 +192,86 @@ class Module(Layer, ABC):
     def layer_weights(self) -> dict[str, Weight]:
         return self._layer_weights
 
-    def __delattr__(self, name: str):
+    def __delattr__(self, name: str) -> None:
         self._sublayers.pop(name, None)
         self._layer_weights.pop(name, None)
         self._shared_weights.pop(name, None)
         super().__delattr__(name)
 
-    def set_shared_weight(self, name: str, weight: Weight):
+    def set_shared_weight(self, name: str, weight: Weight) -> None:
         setattr(self, name, weight)
         self._shared_weights[name] = weight
+
+    def build_subgraph(
+        self,
+        name: str,
+        input_types: Sequence[Type | list[Type]],
+        weight_prefix: str = "",
+    ) -> Graph:
+        """Builds a subgraph for this module.
+
+        This method creates a subgraph that encapsulates the module's logic,
+        handling input types, weights, and creating a graph with the module's
+        computation.
+
+        Once the subgraph is built, it can be called using the :obj:`ops.call`
+        op.
+
+        Args:
+            name: The name of the subgraph to create.
+            input_types: A list of input types for the subgraph. Each element can be
+                either a single :obj:`Type` or a list of :obj:`Type` objects.
+            weight_prefix: Optional prefix for weight names in the subgraph. If provided,
+                weights with names starting with this prefix will have their names
+                modified by removing the prefix and will be marked as placeholders.
+
+        Returns:
+            :obj:`Graph`: The created subgraph containing the module's computation.
+
+        Note:
+            - Placeholder weights will require the :obj:`prefix` attribute of :obj:`ops.call` to be set.
+        """
+        layer_weights = list(self.raw_state_dict().values())
+        subgraph_input_types: list[Type] = []
+
+        def flatten(t, result) -> None:  # noqa: ANN001
+            if isinstance(t, (list, tuple)):
+                for item in t:
+                    flatten(item, result)
+            else:
+                result.append(t)
+
+        def take(it: Iterable[Value], n: int) -> list[Value]:
+            """Return the next *n* items from *it* as a list."""
+            return list(islice(it, n))
+
+        flatten(input_types, subgraph_input_types)
+        with Graph.current.add_subgraph(
+            name, input_types=subgraph_input_types
+        ) as subgraph:
+            subgraph_inputs = []
+            inputs = iter(subgraph.inputs)
+
+            for input_type in input_types:
+                if isinstance(input_type, list):
+                    subgraph_inputs.append(take(inputs, len(input_type)))
+                else:
+                    subgraph_inputs.append(next(inputs))
+
+            if weight_prefix:
+                for weight in filter(
+                    lambda w: w.name.startswith(weight_prefix), layer_weights
+                ):
+                    weight._placeholder = True
+                    weight.name = weight.name.removeprefix(weight_prefix)
+
+            result = self(*subgraph_inputs)
+            if isinstance(result, (list, tuple)):
+                subgraph.output(*result)
+            else:
+                subgraph.output(result)
+
+        return subgraph
 
     @property
     def sublayers(self) -> dict[str, Module]:
@@ -232,6 +349,7 @@ class Module(Layer, ABC):
                     f"If you want to load a model with a state_dict that may "
                     f"contain unused keys, set strict=False. "
                     f"The unused keys are:\n {unused_keys_str}"
+                    f"The loaded keys that are not unused are:\n {loaded_keys - state_dict.keys()}"
                 )
                 raise ValueError(msg)
 
@@ -263,8 +381,7 @@ class Module(Layer, ABC):
                     )
                 # Contents of weights should be filled with zeros.
                 data = self._weight_values[full_weight_name] = Tensor.zeros(
-                    shape=weight.shape.static_dims,
-                    dtype=weight.dtype,
+                    shape=weight.shape.static_dims, dtype=weight.dtype
                 )
             state_dict[full_weight_name] = data
             weight.name = full_weight_name
@@ -397,9 +514,49 @@ def _validate_weight_value(weight: Weight, value: Any, name: str) -> None:
     shape, dtype = _get_value_shape_dtype(value)
 
     diffs = []
-    weight_shape = tuple(weight.shape.static_dims)
-    if shape != weight_shape:
-        diffs.append(f"shape (expected={weight_shape}, actual={shape})")
+
+    # Check if weight has symbolic dimensions
+    # Convert weight.shape to list to ensure it's sized
+    weight_shape_dims = list(weight.shape)
+    weight_has_symbolic_dims = len(weight_shape_dims) != len(
+        weight.shape.static_dims
+    )
+
+    # Convert shape to tuple to ensure it's sized
+    shape_tuple = tuple(shape)
+
+    if weight_has_symbolic_dims:
+        # For weights with symbolic dimensions, validate by comparing static dimensions
+        # at their correct positions, allowing symbolic dimensions to vary
+        if len(shape_tuple) != len(weight_shape_dims):
+            # Shape rank must match
+            diffs.append(
+                f"shape rank (expected={len(weight_shape_dims)}, actual={len(shape_tuple)})"
+            )
+        else:
+            # Check each dimension: static dims must match, symbolic dims can vary
+            mismatches = []
+            for i, (weight_dim, value_dim) in enumerate(
+                zip(weight_shape_dims, shape_tuple)
+            ):
+                if isinstance(weight_dim, StaticDim):
+                    # This is a static dimension - must match exactly
+                    if int(weight_dim) != value_dim:
+                        mismatches.append(
+                            f"dim[{i}]: expected {int(weight_dim)}, got {value_dim}"
+                        )
+                # Symbolic dimensions are allowed to vary, so no check needed
+
+            if mismatches:
+                diffs.append(f"shape ({', '.join(mismatches)})")
+    else:
+        # For fully static weights, use the original validation
+        weight_shape = tuple(weight.shape.static_dims)
+        if shape_tuple != weight_shape:
+            diffs.append(
+                f"shape (expected={weight_shape}, actual={shape_tuple})"
+            )
+
     if dtype != weight.dtype:
         diffs.append(f"dtype (expected={weight.dtype}, actual={dtype})")
     if diffs:
@@ -425,7 +582,7 @@ def recursive_named_layers(
 
         yield (name, layer)
         prefix = f"{name}." if name else ""
-        for local_name, layer in layer.sublayers.items():
+        for local_name, layer in layer.sublayers.items():  # noqa: B020
             queue.append((f"{prefix}{local_name}", layer))
 
 
@@ -467,14 +624,14 @@ def add_layer_hook(
     _LAYER_HOOKS.append(fn)
 
 
-def clear_hooks():
+def clear_hooks() -> None:
     """Remove all hooks."""
     _LAYER_HOOKS.clear()
 
 
-def _call_with_hooks(call_fn):
+def _call_with_hooks(call_fn):  # noqa: ANN001
     @wraps(call_fn)
-    def __call_with_hooks(layer, *args, **kwargs):
+    def __call_with_hooks(layer, *args, **kwargs):  # noqa: ANN001
         # Hide this wrapper from rich traceback.
         _rich_traceback_omit = True
 

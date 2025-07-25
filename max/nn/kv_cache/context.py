@@ -13,22 +13,23 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
+from typing import Optional, Protocol, runtime_checkable
 
 import numpy as np
-
-if TYPE_CHECKING:
-    from max.pipelines.core import TextGenerationStatus
+from max.interfaces import GenerationStatus, RequestID
 
 
 @runtime_checkable
 class KVCacheAwareContext(Protocol):
     """A Protocol identifying the minimum API necessary for interacting with a KV Cache."""
 
-    def update_status(self, status: TextGenerationStatus) -> None: ...
+    @property
+    def request_id(self) -> RequestID: ...
+
+    def update_status(self, status: GenerationStatus) -> None: ...
 
     @property
-    def status(self) -> TextGenerationStatus: ...
+    def status(self) -> GenerationStatus: ...
 
     @property
     def is_done(self) -> bool: ...
@@ -101,8 +102,8 @@ class KVCacheAwareContext(Protocol):
         ...
 
     @property
-    def matcher(self) -> Optional[xgr.GrammarMatcher]:  # type: ignore
-        """An optional xgr Grammar Matcher provided when using structured output."""
+    def matcher(self) -> Optional[llguidance.LLMatcher]:  # type: ignore
+        """An optional Grammar Matcher provided when using structured output."""
         ...
 
     @property
@@ -110,7 +111,7 @@ class KVCacheAwareContext(Protocol):
         """A json schema to use during constrained decoding."""
         ...
 
-    def set_matcher(self, matcher: xgr.GrammarMatcher) -> None:  # type: ignore
+    def set_matcher(self, matcher: llguidance.LLMatcher) -> None:  # type: ignore
         """Set a grammar matcher for use during constrained decoding."""
         ...
 

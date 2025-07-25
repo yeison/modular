@@ -20,8 +20,8 @@ from math import floor
 """
 
 from sys import (
+    CompilationTarget,
     bitwidthof,
-    has_avx512f,
     is_amd_gpu,
     is_gpu,
     is_nvidia_gpu,
@@ -32,15 +32,14 @@ from sys import (
 )
 from sys._assembly import inlined_assembly
 from sys.ffi import _external_call_const
-from sys.info import _is_sm_9x_or_newer
+from sys.info import _is_sm_9x_or_newer, is_32bit
 
 from algorithm import vectorize
-from bit import count_leading_zeros, count_trailing_zeros
+from bit import count_trailing_zeros
 from builtin.dtype import _integral_type_of
 from builtin.simd import _modf, _simd_apply
-from memory import Span, UnsafePointer
+from memory import Span
 
-from utils.index import IndexList
 from utils.numerics import FPUtils, isnan, nan
 from utils.static_tuple import StaticTuple
 
@@ -133,10 +132,8 @@ fn ceildiv[T: CeilDivableRaising, //](numerator: T, denominator: T) raises -> T:
 # before overload resolution.
 @always_inline("builtin")
 fn ceildiv(
-    numerator: IntLiteral,
-    denominator: IntLiteral,
-    out result: __type_of(numerator.__ceildiv__(denominator)),
-):
+    numerator: IntLiteral, denominator: IntLiteral
+) -> __type_of(numerator.__ceildiv__(denominator)):
     """Return the rounded-up result of dividing numerator by denominator.
 
     Args:
@@ -146,7 +143,7 @@ fn ceildiv(
     Returns:
         The ceiling of dividing numerator by denominator.
     """
-    result = __type_of(result)()
+    return {}
 
 
 # ===----------------------------------------------------------------------=== #
@@ -437,17 +434,23 @@ fn exp2[
         ](x)
 
     @parameter
-    if dtype not in (DType.float32, DType.float64):
+    if dtype is DType.float32:
+        return _exp2_float32(x._refine[DType.float32]())._refine[dtype]()
+    elif dtype is DType.float64:
+        return 2**x
+    else:
         return exp2(x.cast[DType.float32]()).cast[dtype]()
 
+
+@always_inline
+fn _exp2_float32(x: SIMD[DType.float32, _]) -> __type_of(x):
+    alias u32 = DType.uint32
     var xc = x.clamp(-126, 126)
-
-    var m = xc.cast[__type_of(x.to_bits()).dtype]()
-
-    xc -= m.cast[dtype]()
+    var m = xc.cast[DType.int32]()
+    xc -= m.cast[x.dtype]()
 
     var r = polynomial_evaluate[
-        List[Scalar[dtype]](
+        List[Float32](
             1.0,
             0.693144857883,
             0.2401793301105,
@@ -456,8 +459,9 @@ fn exp2[
             1.33336498402e-3,
         ),
     ](xc)
-    return __type_of(r).from_bits(
-        (r.to_bits() + (m << FPUtils[dtype].mantissa_width()))
+    return __type_of(x).from_bits(
+        r.to_bits[u32]()
+        + (m.cast[u32]() << FPUtils[DType.float32].mantissa_width())
     )
 
 
@@ -491,7 +495,11 @@ fn _ldexp_impl[
     alias hardware_width = simdwidthof[dtype]()
 
     @parameter
-    if has_avx512f() and dtype is DType.float32 and width >= hardware_width:
+    if (
+        CompilationTarget.has_avx512f()
+        and dtype is DType.float32
+        and width >= hardware_width
+    ):
         var res: SIMD[dtype, width] = 0
         var zero: SIMD[dtype, hardware_width] = 0
 
@@ -725,7 +733,7 @@ fn frexp[
     alias mantissa_width = FPUtils[dtype].mantissa_width()
     var mask1 = _frexp_mask1[dtype, width]()
     var mask2 = _frexp_mask2[dtype, width]()
-    var x_int = x.to_bits()
+    var x_int = x._to_bits_signed()
     var selector = x != zero
     var exp = selector.select(
         (((mask1 & x_int) >> mantissa_width) - exponent_bias).cast[dtype](),
@@ -852,16 +860,18 @@ fn log2[dtype: DType, width: Int, //](x: SIMD[dtype, width]) -> __type_of(x):
         Vector containing result of performing log base 2 on x.
     """
 
-    @parameter
-    if is_nvidia_gpu():
+    if not is_compile_time():
 
         @parameter
-        if sizeof[dtype]() < sizeof[DType.float32]():
-            return log2(x.cast[DType.float32]()).cast[dtype]()
-        elif dtype is DType.float32:
-            return _call_ptx_intrinsic[
-                instruction="lg2.approx.f32", constraints="=f,f"
-            ](x)
+        if is_nvidia_gpu():
+
+            @parameter
+            if sizeof[dtype]() < sizeof[DType.float32]():
+                return log2(x.cast[DType.float32]()).cast[dtype]()
+            elif dtype is DType.float32:
+                return _call_ptx_intrinsic[
+                    instruction="lg2.approx.f32", constraints="=f,f"
+                ](x)
 
     return _log_base[2](x)
 
@@ -894,16 +904,17 @@ fn copysign[
     Returns:
         Copies the sign from sign to magnitude.
     """
+    constrained[dtype.is_numeric(), "operands must be a numeric type"]()
 
     @parameter
-    if dtype.is_integral():
+    if dtype.is_unsigned():
+        return magnitude
+    elif dtype.is_integral():
         var mag_abs = abs(magnitude)
-        return (sign > 0).select(mag_abs, -mag_abs)
-    else:
-        constrained[dtype.is_numeric(), "operands must be a numeric type"]()
-        return llvm_intrinsic[
-            "llvm.copysign", SIMD[dtype, width], has_side_effect=False
-        ](magnitude, sign)
+        return (sign < 0).select(-mag_abs, mag_abs)
+    return llvm_intrinsic[
+        "llvm.copysign", SIMD[dtype, width], has_side_effect=False
+    ](magnitude, sign)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1147,10 +1158,7 @@ fn iota[
 
     alias step_dtype = dtype if dtype.is_integral() else DType.index
     var step: SIMD[step_dtype, width]
-    alias is_amd = is_amd_gpu()
-    # We can't use llvm.stepvector on AMD GPUs, because of a bug in the
-    # amd backend. See https://github.com/llvm/llvm-project/issues/139317
-    if is_amd or is_compile_time():
+    if is_compile_time():
         step = 0
 
         @parameter
@@ -1199,7 +1207,7 @@ fn iota[dtype: DType, //](mut v: List[Scalar[dtype], *_], offset: Int = 0):
         v: The list to fill with numbers.
         offset: The starting value to fill at index 0.
     """
-    iota(v.data, len(v), offset)
+    iota(v.unsafe_ptr(), len(v), offset)
 
 
 fn iota(mut v: List[Int, *_], offset: Int = 0):
@@ -1209,7 +1217,7 @@ fn iota(mut v: List[Int, *_], offset: Int = 0):
         v: The list to fill with numbers.
         offset: The starting value to fill at index 0.
     """
-    var buff = v.data.bitcast[Scalar[DType.index]]()
+    var buff = v.unsafe_ptr().bitcast[Scalar[DType.index]]()
     iota(buff, len(v), offset=offset)
 
 
@@ -1647,9 +1655,9 @@ fn _atanh_float32(x: SIMD) -> __type_of(x):
     """This computes the `atanh` of the inputs for float32. It uses the same
     approximation used by Eigen library."""
 
-    alias nan_val = __type_of(x)(nan[x.dtype]())
-    alias inf_val = __type_of(x)(inf[x.dtype]())
-    alias neg_inf_val = __type_of(x)(-inf[x.dtype]())
+    alias nan_val = nan[x.dtype]()
+    alias inf_val = inf[x.dtype]()
+    alias neg_inf_val = -inf[x.dtype]()
 
     var is_neg = x < 0
     var x_abs = abs(x)
@@ -2338,7 +2346,6 @@ fn lcm(m: Int, n: Int, /) -> Int:
     Returns:
         The least common multiple of the two integers.
     """
-    var d: Int
     if d := gcd(m, n):
         return abs((m // d) * n if m > n else (n // d) * m)
     return 0
@@ -2500,7 +2507,9 @@ fn factorial(n: Int) -> Int:
         121645100408832000,
         2432902008176640000,
     )
-    debug_assert(0 <= n <= 20, "input value causes an overflow")
+    debug_assert(
+        0 <= n <= (12 if is_32bit() else 20), "input value causes an overflow"
+    )
     return table[n]
 
 
@@ -2575,22 +2584,14 @@ fn clamp[
 # ===----------------------------------------------------------------------=== #
 
 
-fn _type_is_libm_supported(dtype: DType) -> Bool:
-    return dtype in (DType.float32, DType.float64) or dtype.is_integral()
-
-
+@always_inline("nodebug")
 fn _call_libm[
+    dtype: DType,
+    width: Int, //,
     func_name: StaticString,
-    arg_type: DType,
-    width: Int,
-    *,
-    result_type: DType = arg_type,
-](arg: SIMD[arg_type, width]) -> SIMD[result_type, width]:
+](arg: SIMD[dtype, width]) -> SIMD[dtype, width]:
     constrained[
-        arg_type.is_floating_point(), "argument type must be floating point"
-    ]()
-    constrained[
-        arg_type == result_type, "the argument type must match the result type"
+        dtype.is_floating_point(), "argument type must be floating point"
     ]()
     constrained[
         not is_nvidia_gpu(),
@@ -2598,32 +2599,17 @@ fn _call_libm[
     ]()
 
     @parameter
-    if not _type_is_libm_supported(arg_type):
-        # Coerse to f32 if the value is not representable by libm.
-        return _call_libm_impl[func_name, result_type = DType.float32](
-            arg.cast[DType.float32]()
-        ).cast[result_type]()
+    if dtype not in [DType.float32, DType.float64]:
+        # Coerce to f32 if the value is not representable by libm.
+        var arg_f32 = arg.cast[DType.float32]()
+        return _call_libm[func_name](arg_f32).cast[dtype]()
 
-    return _call_libm_impl[func_name, result_type=result_type](arg)
-
-
-fn _call_libm_impl[
-    func_name: StaticString,
-    arg_type: DType,
-    width: Int,
-    *,
-    result_type: DType = arg_type,
-](arg: SIMD[arg_type, width]) -> SIMD[result_type, width]:
-    alias libm_name = String(
-        func_name
-    ) if arg_type is DType.float64 else func_name + "f"
-
-    var res = SIMD[result_type, width]()
+    alias libm_name = func_name + ("f" if dtype is DType.float32 else "")
+    var res = SIMD[dtype, width]()
 
     @parameter
     for i in range(width):
-        res[i] = _external_call_const[libm_name, Scalar[result_type]](arg[i])
-
+        res[i] = _external_call_const[libm_name, Scalar[dtype]](arg[i])
     return res
 
 
@@ -2782,8 +2768,8 @@ trait Ceilable:
     ```mojo
     from math import Ceilable, ceil
 
-    @value
-    struct Complex(Ceilable):
+    @fieldwise_init
+    struct Complex(Ceilable, Copyable):
         var re: Float64
         var im: Float64
 
@@ -2819,8 +2805,8 @@ trait Floorable:
     ```mojo
     from math import Floorable, floor
 
-    @value
-    struct Complex(Floorable):
+    @fieldwise_init
+    struct Complex(Floorable, Copyable):
         var re: Float64
         var im: Float64
 
@@ -2857,8 +2843,8 @@ trait CeilDivable:
     ```mojo
     from math import CeilDivable
 
-    @value
-    struct Foo(CeilDivable):
+    @fieldwise_init
+    struct Foo(CeilDivable, Copyable):
         var x: Float64
 
         fn __ceildiv__(self, denominator: Self) -> Self:
@@ -2890,8 +2876,8 @@ trait CeilDivableRaising:
     ```mojo
     from math import CeilDivableRaising
 
-    @value
-    struct Foo(CeilDivableRaising):
+    @fieldwise_init
+    struct Foo(CeilDivableRaising, Copyable):
         var x: Float64
 
         fn __ceildiv__(self, denominator: Self) raises -> Self:
@@ -2928,8 +2914,8 @@ trait Truncable:
     ```mojo
     from math import Truncable, trunc
 
-    @value
-    struct Complex(Truncable):
+    @fieldwise_init
+    struct Complex(Truncable, Copyable):
         var re: Float64
         var im: Float64
 

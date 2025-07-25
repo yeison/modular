@@ -31,9 +31,7 @@ NVIDIA PTX: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#wa
 AMD Matrix Cores: https://gpuopen.com/learn/amd-lab-notes/amd-lab-notes-matrix-cores-readme/
 """
 
-from sys import is_nvidia_gpu
-
-from memory import UnsafePointer
+from sys import is_amd_gpu, is_nvidia_gpu, CompilationTarget
 
 
 @always_inline
@@ -62,7 +60,7 @@ fn load_matrix_a[
         SIMD vector containing 4 TF32 values loaded from matrix A in the required order.
 
     Constraints:
-        The tile demensions must be m=16, n=8, k=8.
+        The tile dimensions must be m=16, n=8, k=8.
     """
 
     constrained[m == 16 and n == 8 and k == 8]()
@@ -108,7 +106,7 @@ fn load_matrix_a[
         SIMD vector containing 4 FP16 values loaded from matrix A in the required order.
 
     Constraints:
-        The tile demensions must be m=16, n=8, k=8.
+        The tile dimensions must be m=16, n=8, k=8.
     """
 
     constrained[m == 16 and n == 8 and k == 8]()
@@ -875,7 +873,11 @@ fn store_matrix_d[
     @parameter
     if is_nvidia_gpu():
         _store_matrix_d_nvidia[m, n, k](d_ptr, d, tile_row, tile_col, ldm)
-    else:
+    elif is_amd_gpu():
         _store_matrix_d_amd[m, n, k, n_blocks](
             d_ptr, d, tile_row, tile_col, ldm
         )
+    else:
+        return CompilationTarget.unsupported_target_error[
+            operation="store_matrix_d"
+        ]()

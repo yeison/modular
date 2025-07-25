@@ -38,14 +38,11 @@ print(info)
 ```
 """
 
-from collections.string.string_slice import StaticString, _get_kgen_string
+from collections.string.string_slice import _get_kgen_string
 from os import PathLike
 from pathlib import Path
 from sys.info import _current_target
 
-from memory import UnsafePointer
-
-from utils import Writer
 
 from .reflection import get_linkage_name
 
@@ -86,7 +83,7 @@ struct _PopulateInfo:
 
 @fieldwise_init
 @register_passable("trivial")
-struct Info[
+struct CompiledFunctionInfo[
     func_type: AnyTrivialRegType,
     func: func_type,
     target: __mlir_type.`!kgen.target`,
@@ -117,7 +114,7 @@ struct Info[
     var num_captures: Int
     """Number of variables captured by the function closure."""
 
-    alias populate = rebind[fn (UnsafePointer[NoneType]) capturing -> None](
+    alias populate = rebind[fn (OpaquePointer) capturing -> None](
         __mlir_attr[
             `#kgen.compile_offload_closure<`,
             target,
@@ -216,7 +213,7 @@ fn compile_info[
     emission_kind: StaticString = "asm",
     compile_options: StaticString = "",
     target: __mlir_type.`!kgen.target` = _current_target(),
-]() -> Info[func_type, func, target]:
+]() -> CompiledFunctionInfo[func_type, func, target]:
     """Compiles a function and returns detailed compilation information.
 
     This function takes a Mojo function and compiles it, providing access to the
@@ -238,7 +235,7 @@ fn compile_info[
             architecture.
 
     Returns:
-        An `Info` struct containing:
+        A `CompiledFunctionInfo` struct containing:
         - asm: The generated code in the requested format
         - linkage_name: The mangled function name for linking
         - module_hash: A unique hash of the compiled module
@@ -271,10 +268,9 @@ fn compile_info[
         _type=_Info,
     ]()
 
-    var result = Info[func_type, func, target](
+    return CompiledFunctionInfo[func_type, func, target](
         asm=offload.asm,
         function_name=get_linkage_name[target, func](),
         module_name=offload.module_name,
         num_captures=offload.num_captures,
     )
-    return result

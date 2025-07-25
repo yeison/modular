@@ -29,8 +29,8 @@ alias blkcnt_t = Int64
 alias blksize_t = Int32
 
 
-@value
-struct _c_stat(Stringable, Writable):
+@fieldwise_init
+struct _c_stat(Copyable, Defaultable, Movable, Stringable, Writable):
     var st_dev: dev_t
     """ID of device containing file."""
     var st_mode: mode_t
@@ -136,7 +136,7 @@ struct _c_stat(Stringable, Writable):
 
 
 @always_inline
-fn _stat(owned path: String) raises -> _c_stat:
+fn _stat(var path: String) raises -> _c_stat:
     var stat = _c_stat()
     var err = external_call["stat", Int32](
         path.unsafe_cstr_ptr(), Pointer(to=stat)
@@ -147,7 +147,7 @@ fn _stat(owned path: String) raises -> _c_stat:
 
 
 @always_inline
-fn _lstat(owned path: String) raises -> _c_stat:
+fn _lstat(var path: String) raises -> _c_stat:
     var stat = _c_stat()
     var err = external_call["lstat", Int32](
         path.unsafe_cstr_ptr(), Pointer(to=stat)

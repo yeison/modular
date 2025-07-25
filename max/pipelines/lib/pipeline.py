@@ -15,13 +15,17 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from os import environ
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Generic,
     Optional,
     Protocol,
@@ -29,8 +33,11 @@ from typing import (
     runtime_checkable,
 )
 
+import llguidance.hf
+import llguidance.numpy
 import numpy as np
-import torch
+import numpy.typing as npt
+from llguidance import LLMatcher
 from max.driver import Device, Tensor, load_devices
 from max.dtype import DType
 from max.engine import InferenceSession
@@ -42,6 +49,12 @@ from max.graph.weights import (
     load_weights,
     weights_format,
 )
+from max.interfaces import (
+    InputContext,
+    LogProbabilities,
+    TextGenerationOutput,
+    TokenGenerator,
+)
 from max.nn.kv_cache import (
     KVCacheInputs,
     KVCacheInputsSequence,
@@ -51,14 +64,6 @@ from max.nn.kv_cache import (
     infer_optimal_batch_size,
 )
 from max.nn.transformer import ReturnLogits
-from max.pipelines.core import (
-    InputContext,
-    LogProbabilities,
-    TextGenerationResponse,
-    TextGenerationStatus,
-    TextResponse,
-    TokenGenerator,
-)
 from max.profiler import Tracer, traced
 from transformers import AutoConfig, AutoTokenizer
 
@@ -67,13 +72,9 @@ if TYPE_CHECKING:
 
 from .config_enums import RepoType, SupportedEncoding
 from .hf_utils import download_weight_files
+from .lora import LoRAManager
 from .max_config import KVCacheConfig
 from .sampling import token_sampler
-
-try:
-    import xgrammar as xgr
-except ImportError:
-    pass
 
 logger = logging.getLogger("max.pipelines")
 
@@ -132,6 +133,19 @@ class ModelInputs:
     """
 
     kv_cache_inputs: KVCacheInputs | None = None
+
+    lora_ids: Tensor | None = None
+    """Tensor containing the LoRA ids."""
+
+    lora_ranks: Tensor | None = None
+    """Tensor containing the LoRA ranks"""
+
+    def update(self, **kwargs) -> None:
+        key: str
+        value: Any
+        for key, value in kwargs.items():
+            if hasattr(self, key) and value is not None:
+                setattr(self, key, value)
 
 
 @dataclass(frozen=True)
@@ -194,10 +208,27 @@ class PipelineModel(ABC, Generic[T]):
         self.adapter = adapter
         self.return_logits = return_logits
 
+        # Initialize `max_seq_len` here to avoid repeated HF config access.
+        self.max_seq_len = self.calculate_max_seq_len(
+            pipeline_config, huggingface_config
+        )
+
         if isinstance(self, KVCacheMixin):
             self.kv_manager = self.load_kv_manager(
                 session, self.kv_cache_config._available_cache_memory
             )
+
+        self._lora_manager = (
+            LoRAManager(
+                pipeline_config.model_config.model_path,
+                weights,
+                self.pipeline_config.lora_config.max_num_loras,
+                self.pipeline_config.lora_config.max_lora_rank,
+                self.pipeline_config.lora_config.lora_paths,
+            )
+            if self.pipeline_config.lora_config
+            else None
+        )
 
     @property
     def dtype(self) -> DType:
@@ -264,9 +295,7 @@ class PipelineModel(ABC, Generic[T]):
 
         # TODO we should map HF configs to a unified MAX Config object
         # this would help avoid these excessive calls to class methods.
-        n_layers = cls.get_num_layers(
-            huggingface_config=huggingface_config,
-        )
+        n_layers = cls.get_num_layers(huggingface_config=huggingface_config)
 
         kv_params = cls.get_kv_params(
             huggingface_config=huggingface_config,
@@ -277,8 +306,7 @@ class PipelineModel(ABC, Generic[T]):
         inferred_batch_size = infer_optimal_batch_size(
             params=kv_params,
             max_seq_len=cls.calculate_max_seq_len(
-                pipeline_config,
-                huggingface_config=huggingface_config,
+                pipeline_config, huggingface_config=huggingface_config
             ),
             num_layers=n_layers,
             available_cache_memory=available_cache_memory,
@@ -300,6 +328,28 @@ class PipelineModel(ABC, Generic[T]):
         # Better yet, make this more accurate by loading and measuring memory consumption
         # after we load the model
         return pipeline_config.model_config.weights_size()
+
+    @classmethod
+    def estimate_activation_memory(
+        cls, pipeline_config: PipelineConfig, huggingface_config: AutoConfig
+    ) -> int:
+        """Estimates the activation memory required for model execution.
+
+        This accounts for temporary memory buffers used during model execution,
+        such as intermediate activations and working buffers.
+
+        The default implementation returns 0 for backward compatibility.
+        Models with significant activation memory requirements should override
+        this method to provide accurate estimates.
+
+        Args:
+            pipeline_config: Pipeline configuration
+            huggingface_config: HuggingFace model configuration
+
+        Returns:
+            Estimated activation memory in bytes
+        """
+        return 0
 
     @abstractmethod
     def execute(
@@ -354,6 +404,7 @@ class PipelineModel(ABC, Generic[T]):
 
     def compute_log_probabilities(
         self,
+        session: InferenceSession,
         model_inputs: ModelInputs,
         model_outputs: ModelOutputs,
         next_tokens: Tensor,
@@ -363,6 +414,7 @@ class PipelineModel(ABC, Generic[T]):
         """Optional method that can be overridden to compute log probabilities.
 
         Args:
+            session: Inference session to compute log probabilities within.
             model_inputs: Inputs to the model returned by
                 `prepare_*_token_inputs()`.
             model_outputs: Outputs returned by `execute()`.
@@ -449,6 +501,20 @@ def get_paged_manager(
     return None
 
 
+@dataclasses.dataclass
+class BatchInfo:
+    """Information about a batch of requests passed to the pipeline"""
+
+    past_seq_lens: list[int]
+    """Coordinated list of past sequence lengths (i.e. context lengths)"""
+
+    seq_lens: list[int]
+    """Coordinated list of sequence lengths, i.e. prompt_len or 1"""
+
+    num_steps: int
+    """Number of steps to do in the pipeline"""
+
+
 class TextGenerationPipeline(TokenGenerator[T]):
     """Generalized token generator pipeline."""
 
@@ -464,10 +530,13 @@ class TextGenerationPipeline(TokenGenerator[T]):
         self._devices = load_devices(pipeline_config.model_config.device_specs)
         self._weight_adapters = weight_adapters
 
+        self.batch_info_output_fname = environ.get(
+            "MAX_BATCH_INFO_FILENAME", None
+        )
+        self.batch_infos: list[BatchInfo] = []
+
         # Expand eos tokens if more are provided in pipeline_config
-        if self._pipeline_config.ignore_eos:
-            self._eos_token_id = set([])
-        elif (
+        if (
             "eos_token_id"
             in self._pipeline_config.model_config.huggingface_config
         ):
@@ -498,12 +567,9 @@ class TextGenerationPipeline(TokenGenerator[T]):
                 pipeline_config.model_config.model_path
             )
             self.vocab_size = len(self.tokenizer)
-            tokenizer_info = xgr.TokenizerInfo.from_huggingface(
-                self.tokenizer,
-                vocab_size=self.vocab_size,
+            self._tokenizer_info = llguidance.hf.from_tokenizer(
+                self.tokenizer, n_vocab=self.vocab_size
             )
-
-            self._grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
 
         # Initialize Session.
         session = InferenceSession(devices=self._devices)
@@ -527,6 +593,9 @@ class TextGenerationPipeline(TokenGenerator[T]):
             raise ValueError("quantization_encoding must not be None")
 
         # Retrieve the weight id, if different than the model_path
+
+        # TODO: These should ideally not call _weights_repo_id directly. I believe
+        # huggingface_weight_repo_id property can be used here?
         weight_model_id = (
             self._pipeline_config.model_config._weights_repo_id
             if self._pipeline_config.model_config._weights_repo_id
@@ -576,7 +645,7 @@ class TextGenerationPipeline(TokenGenerator[T]):
             token_sampler(
                 self._pipeline_config.sampling_config,
                 device=DeviceRef.from_device(self._devices[0]),
-            ),
+            )
         )
 
     def calculate_num_steps(
@@ -584,40 +653,28 @@ class TextGenerationPipeline(TokenGenerator[T]):
         num_steps: int,
         context: T,
     ) -> int:
-        max_seq_len = self._pipeline_model.calculate_max_seq_len(
-            self._pipeline_config,
-            huggingface_config=self._pipeline_config.model_config.huggingface_config,
-        )
+        max_seq_len = self._pipeline_model.max_seq_len
         num_available_steps = context.compute_num_available_steps(max_seq_len)
 
         if num_available_steps <= 0:
             raise ValueError(
-                f"Request {context.cache_seq_id} length ({context.current_length}) is larger than or equal to the configured max_length ({max_seq_len})"
+                f"Request {context.request_id} length ({context.current_length}) is larger than or equal to the configured max_length ({max_seq_len})"
             )
 
-        return (
-            num_steps
-            if num_available_steps > num_steps
-            else num_available_steps
-        )
+        return min(num_available_steps, num_steps)
 
     @traced
     def prepare_batch(
         self,
         batch: list[T],
         num_steps: int,
-    ) -> tuple[ModelInputs, int, Optional[torch.Tensor]]:
+    ) -> tuple[ModelInputs, int, Optional[npt.NDArray[np.int32]]]:
         tracer: Tracer = Tracer("prepare_batch")
 
         if self._pipeline_config.sampling_config.enable_structured_output:
             assert self.vocab_size is not None
-            bitmask = torch.full(
-                xgr.get_bitmask_shape(
-                    len(batch),
-                    self.vocab_size,
-                ),
-                -1,
-                dtype=torch.int32,
+            bitmask = llguidance.numpy.allocate_token_bitmask(
+                len(batch), self.vocab_size
             )
         else:
             bitmask = None
@@ -631,38 +688,32 @@ class TextGenerationPipeline(TokenGenerator[T]):
                     raise ValueError(msg)
 
                 try:
-                    compiled_grammar = (
-                        self._grammar_compiler.compile_json_schema(
-                            context.json_schema,
-                            any_whitespace=False,
-                        )
+                    serialized_grammar = LLMatcher.grammar_from_json_schema(
+                        context.json_schema,
+                        defaults={
+                            "whitespace_flexible": False,
+                        },
                     )
-                    matcher = xgr.GrammarMatcher(compiled_grammar)
+                    matcher = LLMatcher(
+                        self._tokenizer_info, serialized_grammar
+                    )
                     context.set_matcher(matcher)
                 except Exception as e:
                     msg = f"Json schema provided in request cannot be compiled to valid grammar. \
-                    Please update your json schema to produce valid structured output. From XGrammar: {e}"
+                    Please update your json schema to produce valid structured output. From llguidance: {e}"
                     logger.warning(msg)
                     # I am removing the json_schema, so it doesn't try to load the grammar repeatedly.
                     context.json_schema = None  # type: ignore
 
             if context.matcher:
-                if (
-                    jump_forward_string
-                    := context.matcher.find_jump_forward_string()
-                ):
-                    tokens = self.tokenizer.encode(
-                        jump_forward_string, add_special_tokens=False
-                    )
-                    for token in tokens:
-                        context.jump_ahead(token)
+                jump_forward_tokens = context.matcher.compute_ff_tokens()
+                for token in jump_forward_tokens:
+                    context.jump_ahead(token)
 
             # Claim cache rows for context.
-            if not self._pipeline_model.kv_manager.contains(
-                context.cache_seq_id
-            ):
+            if not self._pipeline_model.kv_manager.contains(context.request_id):
                 self._pipeline_model.kv_manager.external_claim(
-                    [context.cache_seq_id]
+                    context.request_id
                 )
 
             # Update num_steps.
@@ -672,8 +723,11 @@ class TextGenerationPipeline(TokenGenerator[T]):
             if (
                 self._pipeline_config.sampling_config.enable_structured_output
                 and context.matcher
+                and bitmask is not None
             ):
-                context.matcher.fill_next_token_bitmask(bitmask, index=i)
+                llguidance.numpy.fill_next_token_bitmask(
+                    context.matcher, bitmask, index=i
+                )
 
         # `fetch` may shorten the input context by bumping the start_idx.
         tracer.next("fetch_kv_cache")
@@ -713,7 +767,7 @@ class TextGenerationPipeline(TokenGenerator[T]):
         # Calculate max size needed for token frequency pairs
         if include_prompt:
             total_tokens = sum(
-                len(context.tokens) + padding_size for context in batch
+                context.current_length + padding_size for context in batch
             )
         else:
             total_tokens = sum(
@@ -725,7 +779,10 @@ class TextGenerationPipeline(TokenGenerator[T]):
         tracer.next("build_token_frequency_csr_loop")
         for i, context in enumerate(batch):
             unique_tokens, counts = np.unique(
-                context.generated_tokens, return_counts=True
+                context.all_tokens
+                if include_prompt
+                else context.generated_tokens,
+                return_counts=True,
             )
             # Pad the tokens and counts to reserve space for new tokens
             unique_tokens = np.pad(
@@ -758,42 +815,163 @@ class TextGenerationPipeline(TokenGenerator[T]):
             ),
         )
 
+    def _check_need_penalties(self, batch: list[T]) -> None:
+        """Check if the batch has penalties, but do_penalties is False."""
+        for context in batch:
+            if (
+                context.sampling_params.frequency_penalty != 0.0
+                or context.sampling_params.presence_penalty != 0.0
+                or context.sampling_params.repetition_penalty != 1.0
+            ):
+                logger.warning(
+                    "penalties are provided in the request, but the model was not configured with do_penalties=True, ignoring"
+                )
+                return
+
+    @traced
+    def _build_min_tokens_masks(
+        self,
+        batch: list[T],
+        num_steps: int,
+    ) -> list[Tensor] | None:
+        """Build a mask of the min tokens for the batch."""
+        if not self._pipeline_config.sampling_config.enable_min_tokens:
+            for context in batch:
+                if context.min_tokens > 0:
+                    logger.warning(
+                        "min_tokens is provided in the request, but the model was not configured with enable_min_tokens=True, ignoring"
+                    )
+            return None
+
+        min_tokens_masks: list[npt.NDArray[np.int32]] = []
+        min_tokens_masks = batch[0].get_min_token_logit_mask(num_steps)
+
+        for bs in range(1, len(batch)):
+            new_min_tokens_masks = batch[bs].get_min_token_logit_mask(num_steps)
+            for i in range(num_steps):
+                new_min_tokens_masks[i][:, 0] += bs
+                min_tokens_masks[i] = np.concatenate(
+                    (min_tokens_masks[i], new_min_tokens_masks[i])
+                )
+
+        min_tokens_masks_max = [
+            Tensor.from_dlpack(mask).to(self._devices[0])
+            for mask in min_tokens_masks
+        ]
+        return min_tokens_masks_max
+
     @traced
     def sample_logits(
         self,
         logits: Tensor,
         prev_tokens: Tensor,
+        top_k: Tensor,
+        max_k: Tensor,
+        temperature: Tensor,
+        top_p: Tensor,
+        seed: Tensor,
         *,
         logit_offsets: Optional[Tensor] = None,
         bitmask: Optional[Tensor] = None,
         frequency_data: Optional[Sequence[FrequencyData]] = None,
-    ) -> tuple[Tensor, Tensor]:
+        min_tokens_mask: Optional[Tensor] = None,
+        frequency_penalty: Optional[Tensor] = None,
+        presence_penalty: Optional[Tensor] = None,
+        repetition_penalty: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         base_inputs = [logits, prev_tokens]
         opt_inputs = [logit_offsets, bitmask]
+
+        base_inputs = [
+            logits,
+            prev_tokens,
+            top_k,
+            max_k,
+            temperature,
+            top_p,
+            seed,
+        ]
 
         # Add frequency data if provided
         if frequency_data:
             for freq_data in frequency_data:
                 opt_inputs.extend([freq_data.data, freq_data.offsets])
+            assert frequency_penalty is not None
+            assert presence_penalty is not None
+            assert repetition_penalty is not None
+            opt_inputs.extend(
+                [frequency_penalty, presence_penalty, repetition_penalty]
+            )
+
+        if min_tokens_mask:
+            opt_inputs.append(min_tokens_mask)
 
         graph_inputs = base_inputs + [
             tensor for tensor in opt_inputs if tensor is not None
         ]
 
-        a, b = self._sampler(*graph_inputs)[:2]
-        assert isinstance(a, Tensor)
-        assert isinstance(b, Tensor)
-        return (a, b)
+        sampler_output = self._sampler(*graph_inputs)
+        tokens, generated_tokens = sampler_output[:2]
+        new_seed = sampler_output[-1]
+        assert isinstance(tokens, Tensor)
+        assert isinstance(generated_tokens, Tensor)
+        assert isinstance(new_seed, Tensor)
+        return (tokens, generated_tokens, new_seed)
+
+    def _maybe_sort_loras(self, batch: dict[str, T]):
+        """
+        Maybe sorts the batch by LoRA Ids. Requests that use the same LoRA need
+        to be adjacent to each other.
+        """
+        if self._pipeline_model._lora_manager is None:
+            return batch
+
+        return self._pipeline_model._lora_manager.sort_lora_batch(batch)
+
+    def _record_batch_info(self, contexts: Iterable[T], num_steps: int) -> None:
+        """
+        Records batch information for the current inference step.
+
+        Args:
+            contexts (Iterable[T]): An iterable of context objects, each containing
+                'start_idx' (past sequence length) and 'active_length' (current sequence length).
+            num_steps (int): The number of steps processed in this batch.
+
+        Side Effects:
+            Appends a BatchInfo instance to self.batch_infos, capturing the past sequence lengths,
+            current sequence lengths, and number of steps for the batch.
+        """
+        self.batch_infos.append(
+            BatchInfo(
+                past_seq_lens=[x.start_idx for x in contexts],
+                seq_lens=[x.active_length for x in contexts],
+                num_steps=num_steps,
+            )
+        )
+
+    def __del__(self) -> None:
+        if self.batch_info_output_fname is not None:
+            output = {
+                "batch_data": [dataclasses.asdict(x) for x in self.batch_infos]
+            }
+            with open(self.batch_info_output_fname, "w") as f:
+                json.dump(output, f, indent=2)
+                f.flush()  # Refer to MAXSERV-893
 
     @traced
     def next_token(
         self,
         batch: dict[str, T],
         num_steps: int,
-    ) -> dict[str, TextGenerationResponse]:
+    ) -> dict[str, TextGenerationOutput]:
         """Provided a batch, process batch inputs, execute the graph for num_steps in a multi-step scenario,
         then decode the tokens holistically and return the list of decoded tokens.
         """
+
+        batch = self._maybe_sort_loras(batch)
+        if self.batch_info_output_fname is not None:
+            self._record_batch_info(batch.values(), num_steps)
+
         tracer: Tracer = Tracer("compute_parameters")
 
         # Flatten our batch for consistent indexing.
@@ -819,27 +997,85 @@ class TextGenerationPipeline(TokenGenerator[T]):
             device=self._devices[0],
         )
 
+        temperature = Tensor.from_numpy(
+            np.array(
+                [
+                    context.sampling_params.temperature
+                    for context in context_batch
+                ],
+                dtype=np.float32,
+            )
+        ).to(self._devices[0])
+        top_k_np = np.array(
+            [context.sampling_params.top_k for context in context_batch],
+            dtype=np.int64,
+        )
+        top_k = Tensor.from_numpy(top_k_np).to(self._devices[0])
+        max_k_np = np.array(np.max(top_k_np), dtype=np.int64)
+        max_k = Tensor.from_numpy(max_k_np)
+
+        top_p = Tensor.from_numpy(
+            np.array(
+                [context.sampling_params.top_p for context in context_batch],
+                dtype=np.float32,
+            )
+        ).to(self._devices[0])
+        seed = Tensor.from_numpy(
+            np.array(
+                [
+                    context.sampling_params.seed + context.current_length
+                    for context in context_batch
+                ],
+                dtype=np.uint64,
+            )
+        ).to(self._devices[0])
+
         if self._pipeline_config.sampling_config.do_penalties:
-            frequency_data = []
+            frequency_data = [
+                self._build_token_frequency_csr(context_batch, num_steps),
+                self._build_token_frequency_csr(
+                    context_batch, num_steps, include_prompt=True
+                ),
+            ]
 
-            # Only build penalty frequency data if frequency or presence penalties are actually used
-            if (
-                self._pipeline_config.sampling_config.frequency_penalty != 0
-                or self._pipeline_config.sampling_config.presence_penalty != 0
-            ):
-                frequency_data.append(
-                    self._build_token_frequency_csr(context_batch, num_steps)
+            frequency_penalty = Tensor.from_numpy(
+                np.array(
+                    [
+                        context.sampling_params.frequency_penalty
+                        for context in context_batch
+                    ],
+                    dtype=np.float32,
                 )
+            ).to(self._devices[0])
+            presence_penalty = Tensor.from_numpy(
+                np.array(
+                    [
+                        context.sampling_params.presence_penalty
+                        for context in context_batch
+                    ],
+                    dtype=np.float32,
+                )
+            ).to(self._devices[0])
+            repetition_penalty = Tensor.from_numpy(
+                np.array(
+                    [
+                        context.sampling_params.repetition_penalty
+                        for context in context_batch
+                    ],
+                    dtype=np.float32,
+                )
+            ).to(self._devices[0])
 
-            # Only build repetition frequency data if repetition penalty is actually used
-            if self._pipeline_config.sampling_config.repetition_penalty != 1:
-                frequency_data.append(
-                    self._build_token_frequency_csr(
-                        context_batch, num_steps, include_prompt=True
-                    )
-                )
         else:
+            self._check_need_penalties(context_batch)
             frequency_data = None
+            frequency_penalty = None
+            presence_penalty = None
+            repetition_penalty = None
+
+        min_tokens_masks = self._build_min_tokens_masks(
+            context_batch, num_steps
+        )
 
         curr_step_inputs = model_inputs
         batch_log_probabilities = []
@@ -849,40 +1085,53 @@ class TextGenerationPipeline(TokenGenerator[T]):
 
             # Execute the model and get next tokens.
             model_outputs = self._pipeline_model.execute(
-                model_inputs=curr_step_inputs,
+                model_inputs=curr_step_inputs
             )
 
+            tensor_bitmask = None
             if bitmask is not None:
                 assert self.vocab_size is not None
-                bits = 2 ** torch.arange(32, dtype=torch.int32)
-                bitmask = (bitmask.unsqueeze(-1) & bits) != 0
-                bitmask = bitmask.reshape(
-                    len(context_batch),
-                    -1,
-                ).to(torch.bool)
+                bits = 2 ** np.arange(32, dtype=np.int32)
+                bitmask = (bitmask[..., np.newaxis] & bits) != 0
+                bitmask = bitmask.reshape(len(context_batch), -1).astype(
+                    np.bool_
+                )
                 bitmask = bitmask[:, 0 : self.vocab_size]
-
-                bitmask = Tensor.from_dlpack(bitmask).to(self._devices[0])
+                tensor_bitmask = Tensor.from_numpy(bitmask).to(self._devices[0])
 
             # Sample next token.
             tracer.next("sample_next_token")
-            new_tokens, new_generated_tokens = self.sample_logits(
+            new_tokens, new_generated_tokens, new_seed = self.sample_logits(
                 model_outputs.logits,
                 generated_tokens,
+                top_k,
+                max_k,
+                temperature,
+                top_p,
+                seed,
                 logit_offsets=model_outputs.logit_offsets,
-                bitmask=bitmask,
+                bitmask=tensor_bitmask,
                 frequency_data=frequency_data,
+                min_tokens_mask=min_tokens_masks[i]
+                if min_tokens_masks
+                else None,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                repetition_penalty=repetition_penalty,
             )
 
             assert isinstance(new_tokens, Tensor)
             assert isinstance(new_generated_tokens, Tensor)
+            assert isinstance(new_seed, Tensor)
             generated_tokens = new_generated_tokens
+            seed = new_seed
 
             if compute_log_probabilities:
                 try:
                     tracer.next("compute_log_probabilities")
                     batch_log_probabilities.append(
                         self._pipeline_model.compute_log_probabilities(
+                            self.session,
                             curr_step_inputs,
                             model_outputs,
                             new_tokens,
@@ -930,12 +1179,10 @@ class TextGenerationPipeline(TokenGenerator[T]):
         )  # pops multistep_execution_loop_steps
         generated_tokens_host = generated_tokens.to_numpy()
 
-        # Prepare the response, pruning away completed requests as we go.
-        res: dict[str, TextGenerationResponse] = {}
-        tracer.push("prepare_response")
+        # Update the context object.
+        tracer.push("update_context")
+        res: dict[str, TextGenerationOutput] = {}
         for batch_index, (request_id, context) in enumerate(batch.items()):
-            status = TextGenerationStatus.ACTIVE
-            res[request_id] = TextGenerationResponse([], status)
             for step in range(num_steps):
                 # Convert to a Python scalar to improve serialization performance.
                 next_token = int(generated_tokens_host[batch_index, step])
@@ -948,16 +1195,29 @@ class TextGenerationPipeline(TokenGenerator[T]):
                     log_probs = log_probs_for_step[batch_index]
 
                 context.update(
-                    new_token=next_token,
-                    log_probabilities=log_probs,
+                    new_token=next_token, log_probabilities=log_probs
                 )
-                res[request_id].update_status(context.status)
                 if context.is_done:
                     break
 
             # Walk outstanding completion tokens, and return to user.
+            tokens = []
+            log_probabilities: Optional[list[LogProbabilities]] = None
+            if compute_log_probabilities:
+                log_probabilities = []
+
+            status = context.status
             for token, log_probs in context.outstanding_completion_tokens():
-                res[request_id].append_token(TextResponse(token, log_probs))
+                tokens.append(token)
+                if log_probabilities is not None and log_probs is not None:
+                    log_probabilities.append(log_probs)
+
+            res[request_id] = TextGenerationOutput(
+                request_id=request_id,
+                tokens=tokens,
+                log_probabilities=log_probabilities,
+                final_status=status,
+            )
 
         # Update the cache lengths in our kv_cache manager.
         # This should be done after the contexts are updated.
@@ -969,4 +1229,4 @@ class TextGenerationPipeline(TokenGenerator[T]):
 
     def release(self, context: T) -> None:
         """Mark the context as complete, releasing the cache slot from the KV manager."""
-        self._pipeline_model.kv_manager.release(context.cache_seq_id)
+        self._pipeline_model.kv_manager.release(context.request_id)

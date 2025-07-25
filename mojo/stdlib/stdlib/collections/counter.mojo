@@ -20,11 +20,15 @@ from collections import Counter
 """
 from collections.dict import Dict, _DictEntryIter, _DictKeyIter, _DictValueIter
 
+from hashlib import Hasher, default_hasher
+
 from utils import Variant
 
 
 @fieldwise_init
-struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
+struct Counter[V: KeyElement, H: Hasher = default_hasher](
+    Boolable, Copyable, Defaultable, Movable, Sized
+):
     """A container for counting hashable items.
 
     The value type must be specified statically, unlike a Python
@@ -43,10 +47,11 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
     ```
     Parameters:
         V: The value type to be counted. Currently must be KeyElement.
+        H: The type of the hasher in the dict.
     """
 
     # Fields
-    var _data: Dict[V, Int]
+    var _data: Dict[V, Int, H]
 
     # ===------------------------------------------------------------------=== #
     # Life cycle methods
@@ -54,9 +59,9 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
 
     fn __init__(out self):
         """Create a new, empty Counter object."""
-        self._data = Dict[V, Int]()
+        self._data = Dict[V, Int, H]()
 
-    fn __init__(out self, owned *values: V):
+    fn __init__(out self, var *values: V):
         """Create a new Counter from a list of values.
 
         Args:
@@ -70,7 +75,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         print(c["b"])  # print 2
         ```
         """
-        self._data = Dict[V, Int]()
+        self._data = Dict[V, Int, H]()
         for item in values:
             self._data[item] = self._data.get(item, 0) + 1
 
@@ -90,7 +95,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         print(c["b"]) # prints 2
         ```
         """
-        self._data = Dict[V, Int]()
+        self._data = Dict[V, Int, H]()
         for item in items:
             self._data[item] = self._data.get(item, 0) + 1
 
@@ -118,7 +123,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
             value >= 0,
             "value must be non-negative",
         )
-        var result = Counter[V]()
+        var result = Counter[V, H]()
         for key in keys:
             result[key] = value
         return result
@@ -147,7 +152,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         """
         self._data[value] = count
 
-    fn __iter__(self) -> _DictKeyIter[V, Int, __origin_of(self._data)]:
+    fn __iter__(self) -> _DictKeyIter[V, Int, H, __origin_of(self._data)]:
         """Iterate over the keyword dict's keys as immutable references.
 
         Returns:
@@ -203,7 +208,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         @parameter
         @always_inline
         fn is_eq(keys: _DictKeyIter[V, Int, _]) -> Bool:
-            for ref e in keys:
+            for e in keys:
                 if self.get(e, 0) != other.get(e, 0):
                     return False
             return True
@@ -235,7 +240,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         @parameter
         @always_inline
         fn is_le(keys: _DictKeyIter[V, Int, _]) -> Bool:
-            for ref e in keys:
+            for e in keys:
                 if self.get(e, 0) > other.get(e, 0):
                     return False
             return True
@@ -291,7 +296,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         Returns:
             A new Counter with the counts from both Counters added together.
         """
-        var result = Counter[V]()
+        var result = Counter[V, H]()
 
         result.update(self)
         result.update(other)
@@ -342,9 +347,9 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
             A new Counter with the common elements and the minimum count of
             the two Counters.
         """
-        var result = Counter[V]()
+        var result = Counter[V, H]()
 
-        for ref key in self.keys():
+        for key in self.keys():
             if key in other:
                 result[key] = min(self.get(key, 0), other.get(key, 0))
 
@@ -356,7 +361,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         Args:
             other: The other Counter to intersect with.
         """
-        for ref key in self.keys():
+        for key in self.keys():
             if key not in other:
                 try:
                     var key_copy = key  # Copy due to incorrect origins.
@@ -377,14 +382,14 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
             A new Counter with all elements and the maximum count of the two
             Counters.
         """
-        var result = Counter[V]()
+        var result = Counter[V, H]()
 
-        for ref key in self.keys():
+        for key in self.keys():
             var newcount = max(self.get(key, 0), other.get(key, 0))
             if newcount > 0:
                 result[key] = newcount
 
-        for ref key in other.keys():
+        for key in other.keys():
             if key not in self and other.get(key, 0) > 0:
                 result[key] = other.get(key, 0)
 
@@ -396,14 +401,14 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         Args:
             other: The other Counter to union with.
         """
-        for ref key in other.keys():
+        for key in other.keys():
             var newcount = max(self.get(key, 0), other.get(key, 0))
             if newcount > 0:
                 self[key] = newcount
 
     fn _keep_positive(mut self):
         """Remove zero and negative counts from the Counter."""
-        for ref key in self.keys():
+        for key in self.keys():
             if self.get(key, 0) <= 0:
                 try:
                     var key_copy = key  # Copy due to incorrect origins.
@@ -421,21 +426,21 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         Returns:
             A shallow copy of the Counter.
         """
-        var result = Counter[V]()
-        for ref item in self.items():
+        var result = Counter[V, H]()
+        for item in self.items():
             if item.value > 0:
                 result[item.key] = item.value
         return result^
 
     fn __neg__(self) -> Self:
-        """Substract from an empty Counter. Strips positive and zero counts,
+        """Subtract from an empty Counter. Strips positive and zero counts,
         and flips the sign on negative counts.
 
         Returns:
             A new Counter with stripped counts and negative counts.
         """
-        var result = Counter[V]()
-        for ref item in self.items():
+        var result = Counter[V, H]()
+        for item in self.items():
             if item.value < 0:
                 result[item.key] = -item.value
         return result
@@ -482,7 +487,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         """
         return self._data.pop(value)
 
-    fn pop(mut self, value: V, owned default: Int) raises -> Int:
+    fn pop(mut self, value: V, var default: Int) raises -> Int:
         """Remove a value from the Counter by value.
 
         Args:
@@ -500,7 +505,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         """
         return self._data.pop(value, default)
 
-    fn keys(ref self) -> _DictKeyIter[V, Int, __origin_of(self._data)]:
+    fn keys(ref self) -> _DictKeyIter[V, Int, H, __origin_of(self._data)]:
         """Iterate over the Counter's keys as immutable references.
 
         Returns:
@@ -508,7 +513,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         """
         return self._data.keys()
 
-    fn values(ref self) -> _DictValueIter[V, Int, __origin_of(self._data)]:
+    fn values(ref self) -> _DictValueIter[V, Int, H, __origin_of(self._data)]:
         """Iterate over the Counter's values as references.
 
         Returns:
@@ -516,7 +521,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         """
         return self._data.values()
 
-    fn items(self) -> _DictEntryIter[V, Int, __origin_of(self._data)]:
+    fn items(self) -> _DictEntryIter[V, Int, H, __origin_of(self._data)]:
         """Iterate over the dict's entries as immutable references.
 
         Returns:
@@ -564,7 +569,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
             A list of the n most common elements and their counts.
         """
         var items: List[CountTuple[V]] = List[CountTuple[V]]()
-        for ref item in self._data.items():
+        for item in self._data.items():
             var t = CountTuple[V](item.key, item.value)
             items.append(t)
 
@@ -583,7 +588,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
             An iterator over the elements in the Counter.
         """
         var elements: List[V] = List[V]()
-        for ref item in self._data.items():
+        for item in self._data.items():
             for _ in range(item.value):
                 elements.append(item.key)
         return elements
@@ -595,7 +600,7 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         Args:
             other: The Counter to update this Counter with.
         """
-        for ref item in other.items():
+        for item in other.items():
             self._data[item.key] = self._data.get(item.key, 0) + item.value
 
     fn subtract(mut self, other: Self):
@@ -604,14 +609,11 @@ struct Counter[V: KeyElement](Sized, Copyable, Movable, Boolable):
         Args:
             other: The Counter to subtract from this Counter.
         """
-        for ref item in other.items():
+        for item in other.items():
             self[item.key] = self.get(item.key, 0) - item.value
 
 
-struct CountTuple[V: KeyElement](
-    Copyable,
-    Movable,
-):
+struct CountTuple[V: KeyElement](Copyable, Movable):
     """A tuple representing a value and its count in a Counter.
 
     Parameters:
@@ -636,7 +638,7 @@ struct CountTuple[V: KeyElement](
             count: The count of the value in the Counter.
         """
         self._value = value
-        self._count = count
+        self._count = Int(count)
 
     fn copy(self) -> Self:
         """Explicitly construct a copy of self.

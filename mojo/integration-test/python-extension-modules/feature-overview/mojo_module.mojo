@@ -13,19 +13,14 @@
 
 from os import abort
 
-from builtin._pybind import (
+from python import Python, PythonObject
+from python.bindings import (
     check_and_get_arg,
     check_and_get_or_convert_arg,
     check_arguments_arity,
-)
-from memory import UnsafePointer
-from python import Python, PythonObject
-from python.bindings import (
-    PyMojoObject,
     PythonModuleBuilder,
-    lookup_py_type_object,
 )
-from python._cpython import PyObjectPtr, PyTypeObject
+from python._cpython import PyObjectPtr
 
 
 @export
@@ -51,12 +46,15 @@ fn PyInit_mojo_module() -> PythonObject:
 
         _ = (
             b.add_type[Person]("Person")
+            .def_init_defaultable[Person]()
             .def_method[Person.obj_name]("name")
             .def_method[Person.change_name]("change_name")
         )
-        _ = b.add_type[Int]("Int")
-        _ = b.add_type[String]("String")
-        _ = b.add_type[FailToInitialize]("FailToInitialize")
+        _ = b.add_type[Int]("Int").def_init_defaultable[Int]()
+        _ = b.add_type[String]("String").def_init_defaultable[String]()
+        _ = b.add_type[FailToInitialize](
+            "FailToInitialize"
+        ).def_init_defaultable[FailToInitialize]()
         return b.finalize()
     except e:
         return abort[PythonObject](
@@ -82,7 +80,7 @@ fn case_raise_empty_error() -> PythonObject:
 
     cpython.PyErr_SetNone(error_type)
 
-    return PythonObject(from_owned_ptr=PyObjectPtr())
+    return PythonObject(from_owned=PyObjectPtr())
 
 
 fn case_raise_string_error() -> PythonObject:
@@ -92,18 +90,18 @@ fn case_raise_string_error() -> PythonObject:
 
     cpython.PyErr_SetString(error_type, "sample value error".unsafe_cstr_ptr())
 
-    return PythonObject(from_owned_ptr=PyObjectPtr())
+    return PythonObject(from_owned=PyObjectPtr())
 
 
 # Returning New Mojo Values
 fn create_string() raises -> PythonObject:
-    var result = String("Hello")
+    var result = "Hello"
 
     return PythonObject(alloc=result^)
 
 
 fn case_mojo_raise() raises -> PythonObject:
-    raise "Mojo error"
+    raise String("Mojo error")
 
 
 fn case_mojo_mutate(list: PythonObject) raises -> PythonObject:
@@ -128,7 +126,7 @@ fn case_downcast_unbound_type(value: PythonObject) raises:
 
 
 @fieldwise_init
-struct Person(Defaultable, Representable, Copyable, Movable):
+struct Person(Copyable, Defaultable, Movable, Representable):
     var name: String
     var age: Int
 
@@ -160,7 +158,7 @@ struct Person(Defaultable, Representable, Copyable, Movable):
         ).origin_cast[mut=True]()
 
         if len(new_name) > len(self0[].name.codepoints()):
-            raise "cannot make name longer than current name"
+            raise String("cannot make name longer than current name")
 
         self0[].name = String(new_name)
 
@@ -172,7 +170,7 @@ struct Person(Defaultable, Representable, Copyable, Movable):
 # ===----------------------------------------------------------------------=== #
 
 
-struct FailToInitialize(Movable, Defaultable, Representable):
+struct FailToInitialize(Defaultable, Movable, Representable):
     fn __init__(out self):
         pass
 
@@ -196,7 +194,7 @@ fn incr_int(mut arg: Int):
     arg += 1
 
 
-fn add_to_int(mut arg: Int, owned value: Int):
+fn add_to_int(mut arg: Int, var value: Int):
     arg += value
 
 

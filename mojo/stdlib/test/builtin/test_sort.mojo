@@ -10,9 +10,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo %s
 
-from pathlib import Path, _dir_of_current_file
+from pathlib import _dir_of_current_file
 from random import random_float64, random_si64, random_ui64, seed
 
 from builtin.sort import _quicksort, _small_sort, _SortWrapper
@@ -70,7 +69,7 @@ fn test_sort_small_3() raises:
     fn _less_than(lhs: _SortWrapper[Int], rhs: _SortWrapper[Int]) -> Bool:
         return lhs.data < rhs.data
 
-    _small_sort[length, Int, _less_than](list.data)
+    _small_sort[length, Int, _less_than](list.unsafe_ptr())
 
     var expected = [1, 2, 9]
     for i in range(length):
@@ -92,7 +91,7 @@ fn test_sort_small_5() raises:
     fn _less_than(lhs: _SortWrapper[Int], rhs: _SortWrapper[Int]) -> Bool:
         return lhs.data < rhs.data
 
-    _small_sort[length, Int, _less_than](list.data)
+    _small_sort[length, Int, _less_than](list.unsafe_ptr())
 
     var expected = [1, 2, 3, 4, 9]
     for i in range(length):
@@ -536,7 +535,7 @@ def test_sort_strings():
 
 
 @fieldwise_init
-struct Person(Copyable, Movable, Comparable):
+struct Person(Comparable, Copyable, Movable):
     var name: String
     var age: Int
 
@@ -574,7 +573,7 @@ def test_sort_comparamble_elements_list():
     fn gen_list(count: Int):
         list = List[Person]()
         var ages = random_numbers[DType.uint8](count)
-        var names = [String("Maxim"), "Max", "Alex", "Bob", "Joe"]
+        var names = ["Maxim", "Max", "Alex", "Bob", "Joe"]
         for age in ages:
             var name = names[Int(age) % len(names)]
             list.append(Person(name, Int(age)))

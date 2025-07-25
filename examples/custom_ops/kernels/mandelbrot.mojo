@@ -17,8 +17,6 @@ import compiler
 from complex import ComplexSIMD
 from runtime.asyncrt import DeviceContextPtr
 from tensor_internal import (
-    InputTensor,
-    ManagedTensorSlice,
     OutputTensor,
     foreach,
 )
@@ -35,7 +33,7 @@ struct Mandelbrot:
         # The kind of device this will be run on: "cpu" or "gpu"
         target: StaticString,
     ](
-        out: OutputTensor,
+        output: OutputTensor,
         # starting here are the list of inputs
         min_x: Float32,
         min_y: Float32,
@@ -49,7 +47,7 @@ struct Mandelbrot:
         @always_inline
         fn elementwise_mandelbrot[
             width: Int
-        ](idx: IndexList[out.rank]) -> SIMD[out.dtype, width]:
+        ](idx: IndexList[output.rank]) -> SIMD[output.dtype, width]:
             # Obtain the position in the grid from the X, Y thread locations.
             var row = idx[0]
             var col = idx[1]
@@ -67,7 +65,7 @@ struct Mandelbrot:
             var z = ComplexSIMD[float_dtype, width](0, 0)
 
             # Perform the Mandelbrot iteration loop calculation.
-            var iters = SIMD[out.dtype, width](0)
+            var iters = SIMD[output.dtype, width](0)
             var in_set_mask: SIMD[DType.bool, width] = True
             for _ in range(max_iterations):
                 if not any(in_set_mask):
@@ -78,4 +76,4 @@ struct Mandelbrot:
 
             return iters
 
-        foreach[elementwise_mandelbrot, target=target](out, ctx)
+        foreach[elementwise_mandelbrot, target=target](output, ctx)

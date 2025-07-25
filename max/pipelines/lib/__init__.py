@@ -15,7 +15,6 @@
 
 from .config import AudioGenerationConfig, PipelineConfig
 from .config_enums import (
-    PipelineEngine,
     PipelineRole,
     RepoType,
     RopeType,
@@ -23,14 +22,16 @@ from .config_enums import (
 )
 from .embeddings_pipeline import EmbeddingsPipeline
 from .hf_utils import (
-    HuggingFaceFile,
     HuggingFaceRepo,
     download_weight_files,
     generate_local_model_path,
-    repo_exists_with_retry,
+    try_to_load_from_cache,
+    validate_hf_repo_access,
 )
+from .lora import LoRAManager
 from .max_config import (
     KVCacheConfig,
+    LoRAConfig,
     ProfilingConfig,
     SamplingConfig,
 )
@@ -47,43 +48,41 @@ from .pipeline import (
 )
 from .ragged_token_merger import ragged_token_merger
 from .registry import PIPELINE_REGISTRY, SupportedArchitecture
-from .sampling import rejection_sampler, token_sampler
+from .sampling import (
+    rejection_sampler,
+    rejection_sampler_with_residuals,
+    token_sampler,
+)
 from .speculative_decoding import SpeculativeDecodingTextGenerationPipeline
 from .speech_token_pipeline import SpeechTokenGenerationPipeline
 from .tokenizer import (
     IdentityPipelineTokenizer,
-    PipelineTokenizer,
     PreTrainedPipelineTokenizer,
     TextAndVisionTokenizer,
     TextTokenizer,
 )
+from .weight_path_parser import WeightPathParser
 
 __all__ = [
+    "MEMORY_ESTIMATOR",
+    "PIPELINE_REGISTRY",
     "AudioGenerationConfig",
-    "download_weight_files",
     "EmbeddingsPipeline",
-    "generate_local_model_path",
-    "HuggingFaceFile",
     "HuggingFaceRepo",
     "IdentityPipelineTokenizer",
     "KVCacheConfig",
     "KVCacheMixin",
+    "LoRAConfig",
+    "LoRAManager",
     "MAXModelConfig",
     "MAXModelConfigBase",
-    "MEMORY_ESTIMATOR",
     "ModelInputs",
     "ModelOutputs",
     "PipelineConfig",
-    "PipelineEngine",
     "PipelineModel",
     "PipelineRole",
-    "PIPELINE_REGISTRY",
-    "PipelineTokenizer",
     "PreTrainedPipelineTokenizer",
     "ProfilingConfig",
-    "ragged_token_merger",
-    "rejection_sampler",
-    "repo_exists_with_retry",
     "RepoType",
     "RopeType",
     "SamplingConfig",
@@ -94,7 +93,15 @@ __all__ = [
     "TextAndVisionTokenizer",
     "TextGenerationPipeline",
     "TextTokenizer",
-    "token_sampler",
-    "upper_bounded_default",
+    "WeightPathParser",
+    "download_weight_files",
+    "generate_local_model_path",
     "get_paged_manager",
+    "ragged_token_merger",
+    "rejection_sampler",
+    "rejection_sampler_with_residuals",
+    "token_sampler",
+    "try_to_load_from_cache",
+    "upper_bounded_default",
+    "validate_hf_repo_access",
 ]

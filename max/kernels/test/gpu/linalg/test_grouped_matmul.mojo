@@ -11,37 +11,29 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections.optional import Optional, OptionalReg
-from math import ceildiv
-from sys import alignof, has_nvidia_gpu_accelerator, simdwidthof
+from collections import OptionalReg
 
-from algorithm.functional import elementwise
-from buffer import NDBuffer
 from buffer.dimlist import Dim, DimList
-from gpu import barrier, block_dim, block_idx, thread_idx
-from gpu.host import DeviceBuffer, DeviceContext
-from gpu.host._compile import _get_gpu_target
-from gpu.host.info import DEFAULT_GPU_ARCH
+from gpu.host import DeviceContext
 from internal_utils import (
     DeviceNDBuffer,
     HostNDBuffer,
-    arange,
-    fill,
     random,
-    zero,
 )
-from internal_utils._utils import ValOrDim, dynamic, static
-from linalg import vendor_blas
 from linalg.grouped_matmul import grouped_matmul_sm90, naive_grouped_matmul
 from linalg.utils import elementwise_epilogue_type
-from linalg.utils_gpu import MatmulConfig, MatmulKernels
-from memory import UnsafePointer, memset_zero, stack_allocation
-from memory.pointer import _GPUAddressSpace as GPUAddressSpace
+from linalg.utils_gpu import MatmulConfig
 from testing import assert_almost_equal
 
 from utils import IndexList
 from utils.index import Index
-from utils.numerics import FPUtils
+
+
+@always_inline
+fn test_epilogue[
+    dtype: DType
+](m: Int, n: Int, val: Scalar[dtype]) -> Scalar[dtype]:
+    return val + 4 * (Scalar[dtype]((m + n) % 21 - 10))
 
 
 fn test[
@@ -49,6 +41,7 @@ fn test[
     out_type: DType,
     num_experts: Int,
     expert_shape: IndexList[2],
+    has_epilogue: Bool = False,
 ](
     num_active_experts: Int,
     num_tokens_by_expert: List[Int],
@@ -166,10 +159,31 @@ fn test[
         partitioned_multicast=False,
     )
 
+    var c_dev_ndbuffer = c_dev.tensor
+
+    @always_inline
+    @__copy_capture(c_dev_ndbuffer)
+    @parameter
+    fn epilogue_fn[
+        dtype: DType, width: Int, *, alignment: Int = 1
+    ](idx: IndexList[2], val: SIMD[dtype, width]) -> None:
+        var new_val = val
+
+        @parameter
+        for i in range(width):
+            new_val[i] = test_epilogue(idx[0], idx[1] + i, val[i])
+
+        c_dev_ndbuffer.store[width=width, alignment=alignment](
+            idx, new_val.cast[out_type]()
+        )
+
     grouped_matmul_sm90[
         transpose_b=True,
         wgmma_shape = Index(64, 256, 16),
         config=config,
+        elementwise_lambda_fn = OptionalReg[elementwise_epilogue_type](
+            epilogue_fn
+        ) if has_epilogue else None,
     ](
         c_dev.tensor,
         a_dev.tensor,
@@ -190,7 +204,14 @@ fn test[
     c_host_buffer = c_host.tensor
     for m in range(total_num_tokens):
         for n in range(N):
-            var expect = c_ref_host_buffer[m, n]
+            var expect: Scalar[out_type]
+
+            @parameter
+            if has_epilogue:
+                expect = test_epilogue(m, n, c_ref_host_buffer[m, n])
+            else:
+                expect = c_ref_host_buffer[m, n]
+
             var actual = c_host_buffer[m, n]
             assert_almost_equal(
                 actual, expect, msg=String("m: ", m, " n: ", n), rtol=rtol
@@ -243,3 +264,12 @@ fn main() raises:
             num_experts=6,
             expert_shape = Index(1280, 1024),
         ](4, List[Int](27, 1500, 300, 150), List[Int](0, 3, 2, 4), ctx)
+
+        # Multiple matmuls selecting part of experts with epilogue
+        test[
+            DType.bfloat16,
+            DType.bfloat16,
+            num_experts=4,
+            expert_shape = Index(768, 1024),
+            has_epilogue=True,
+        ](2, List[Int](128, 256), List[Int](0, 2), ctx)

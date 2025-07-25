@@ -13,12 +13,21 @@
 """Establishes the contract between `Writer` and `Writable` types."""
 
 from bit import byte_swap
-from collections import InlineArray
-from sys.info import is_amd_gpu, is_gpu, is_nvidia_gpu
+from io.io import _printf
+from sys.info import is_gpu
+from memory import memcpy, bitcast
+from os import abort
+from sys import alignof
+from memory import Span, memcpy
+from sys.param_env import env_get_int
 
-from memory import Span, UnsafePointer, memcpy, bitcast
 
 # ===-----------------------------------------------------------------------===#
+
+alias HEAP_BUFFER_BYTES = env_get_int["HEAP_BUFFER_BYTES", 2048]()
+"""How much memory to pre-allocate for the heap buffer, will abort if exceeded."""
+alias STACK_BUFFER_BYTES = env_get_int["STACK_BUFFER_BYTES", 4096]()
+"""The size of the stack buffer for IO operations from CPU."""
 
 
 trait Writer:
@@ -36,8 +45,8 @@ trait Writer:
     ```mojo
     from memory import Span
 
-    @value
-    struct NewString(Writer, Writable):
+    @fieldwise_init
+    struct NewString(Writer, Writable, Copyable, Movable):
         var s: String
 
         # Writer requirement to write a Span of Bytes
@@ -55,8 +64,8 @@ trait Writer:
             writer.write(self.s)
 
 
-    @value
-    struct Point(Writable):
+    @fieldwise_init
+    struct Point(Writable, Copyable, Movable):
         var x: Int
         var y: Int
 
@@ -157,66 +166,17 @@ trait Writable:
 # ===-----------------------------------------------------------------------===#
 
 
-fn write_args[
-    W: Writer, *Ts: Writable
-](
-    mut writer: W,
-    args: VariadicPack[_, _, Writable, *Ts],
-    *,
-    sep: StaticString = StaticString(),
-    end: StaticString = StaticString(),
-):
-    """
-    Add separators and end characters when writing variadics into a `Writer`.
-
-    Parameters:
-        W: The type of the `Writer` to write to.
-        Ts: The types of each arg to write. Each type must satisfy `Writable`.
-
-    Args:
-        writer: The `Writer` to write to.
-        args: A VariadicPack of Writable arguments.
-        sep: The separator used between elements.
-        end: The String to write after printing the elements.
-
-    Example
-
-    ```mojo
-    import sys
-    from utils import write_args
-
-    fn variadic_pack_function[*Ts: Writable](
-        *args: *Ts, sep: StaticString, end: StaticString
-    ):
-        var stdout = sys.stdout
-        write_args(stdout, args, sep=sep, end=end)
-
-    variadic_pack_function(3, "total", "args", sep=",", end="[end]")
-    ```
-
-    ```
-    3, total, args[end]
-    ```
-    """
-
-    @parameter
-    for i in range(args.__len__()):
-        args[i].write_to(writer)
-        if i < args.__len__() - 1:
-            sep.write_to(writer)
-
-    if end:
-        end.write_to(writer)
-
-
-struct _WriteBufferHeap(Writer):
-    var data: UnsafePointer[UInt8]
+struct _WriteBufferHeap(Writable, Writer):
+    var data: UnsafePointer[Byte]
     var pos: Int
 
-    fn __init__(out self, size: Int):
-        self.data = UnsafePointer[
-            UInt8, address_space = AddressSpace.GENERIC
-        ].alloc(size)
+    fn __init__(out self):
+        alias alignment: Int = alignof[Byte]() if is_gpu() else 1
+        self.data = __mlir_op.`pop.stack_allocation`[
+            count = HEAP_BUFFER_BYTES.value,
+            _type = UnsafePointer[Byte]._mlir_type,
+            alignment = alignment.value,
+        ]()
         self.pos = 0
 
     fn write_list[
@@ -233,16 +193,82 @@ struct _WriteBufferHeap(Writer):
     @always_inline
     fn write_bytes(mut self, bytes: Span[UInt8, _]):
         len_bytes = len(bytes)
-        var ptr = bytes.unsafe_ptr()
+        if len_bytes + self.pos > HEAP_BUFFER_BYTES:
+            _printf[
+                "HEAP_BUFFER_BYTES exceeded, increase with: `mojo -D"
+                " HEAP_BUFFER_BYTES=4096`\n"
+            ]()
+            abort()
+        memcpy(self.data + self.pos, bytes.unsafe_ptr(), len_bytes)
+        self.pos += len_bytes
 
-        # TODO: fix memcpy alignment on nvidia GPU
+    fn write[*Ts: Writable](mut self, *args: *Ts):
         @parameter
-        if is_nvidia_gpu():
-            for i in range(len_bytes):
-                self.data[i + self.pos] = ptr[i]
-        else:
-            memcpy(self.data + self.pos, ptr, len_bytes)
+        for i in range(args.__len__()):
+            args[i].write_to(self)
 
+    fn write_to[W: Writer](self, mut writer: W):
+        writer.write_bytes(
+            Span[Byte, __origin_of(self)](ptr=self.data, length=self.pos)
+        )
+
+    fn nul_terminate(mut self):
+        if self.pos + 1 > HEAP_BUFFER_BYTES:
+            _printf[
+                "HEAP_BUFFER_BYTES exceeded, increase with: `mojo -D"
+                " HEAP_BUFFER_BYTES=4096`\n"
+            ]()
+            abort()
+        self.data[self.pos] = 0
+        self.pos += 1
+
+
+struct _WriteBufferStack[
+    origin: MutableOrigin,
+    W: Writer, //,
+    stack_buffer_bytes: UInt = STACK_BUFFER_BYTES,
+](Writer):
+    var data: InlineArray[UInt8, Int(stack_buffer_bytes)]
+    var pos: Int
+    var writer: Pointer[W, origin]
+
+    @implicit
+    fn __init__(out self, ref [origin]writer: W):
+        self.data = InlineArray[UInt8, Int(stack_buffer_bytes)](
+            uninitialized=True
+        )
+        self.pos = 0
+        self.writer = Pointer(to=writer)
+
+    fn write_list[
+        T: Copyable & Movable & Writable, //
+    ](mut self, values: List[T, *_], *, sep: String = String()):
+        var length = len(values)
+        if length == 0:
+            return
+        self.write(values[0])
+        if length > 1:
+            for i in range(1, length):
+                self.write(sep, values[i])
+
+    fn flush(mut self):
+        self.writer[].write_bytes(
+            Span(ptr=self.data.unsafe_ptr(), length=self.pos)
+        )
+        self.pos = 0
+
+    fn write_bytes(mut self, bytes: Span[Byte, _]):
+        len_bytes = len(bytes)
+        # If span is too large to fit in buffer, write directly and return
+        if len_bytes > Int(stack_buffer_bytes):
+            self.flush()
+            self.writer[].write_bytes(bytes)
+            return
+        # If buffer would overflow, flush writer and reset pos to 0.
+        elif self.pos + len_bytes > Int(stack_buffer_bytes):
+            self.flush()
+        # Continue writing to buffer
+        memcpy(self.data.unsafe_ptr() + self.pos, bytes.unsafe_ptr(), len_bytes)
         self.pos += len_bytes
 
     fn write[*Ts: Writable](mut self, *args: *Ts):
@@ -276,251 +302,6 @@ struct _TotalWritableBytes(Writer):
         @parameter
         for i in range(args.__len__()):
             args[i].write_to(self)
-
-
-struct _WriteBufferStack[
-    origin: MutableOrigin, W: Writer, //, capacity: Int = 4096
-](Writer):
-    var data: InlineArray[UInt8, capacity]
-    var pos: Int
-    var writer: Pointer[W, origin]
-
-    @implicit
-    fn __init__(out self, ref [origin]writer: W):
-        self.data = InlineArray[UInt8, capacity](uninitialized=True)
-        self.pos = 0
-        self.writer = Pointer(to=writer)
-
-    fn write_list[
-        T: Copyable & Movable & Writable, //
-    ](mut self, values: List[T, *_], *, sep: String = String()):
-        var length = len(values)
-        if length == 0:
-            return
-        self.write(values[0])
-        if length > 1:
-            for i in range(1, length):
-                self.write(sep, values[i])
-
-    fn flush(mut self):
-        self.writer[].write_bytes(
-            Span[Byte, ImmutableAnyOrigin](
-                ptr=self.data.unsafe_ptr(), length=self.pos
-            )
-        )
-        self.pos = 0
-
-    fn write_bytes(mut self, bytes: Span[Byte, _]):
-        len_bytes = len(bytes)
-        # If span is too large to fit in buffer, write directly and return
-        if len_bytes > capacity:
-            self.flush()
-            self.writer[].write_bytes(bytes)
-            return
-        # If buffer would overflow, flush writer and reset pos to 0.
-        elif self.pos + len_bytes > capacity:
-            self.flush()
-        # Continue writing to buffer
-        memcpy(self.data.unsafe_ptr() + self.pos, bytes.unsafe_ptr(), len_bytes)
-        self.pos += len_bytes
-
-    fn write[*Ts: Writable](mut self, *args: *Ts):
-        @parameter
-        for i in range(args.__len__()):
-            args[i].write_to(self)
-
-
-fn write_buffered[
-    W: Writer, //,
-    *Ts: Writable,
-    buffer_size: Int = 4096,
-    use_heap: Bool = False,
-](
-    mut writer: W,
-    args: VariadicPack[_, _, Writable, *Ts],
-    *,
-    sep: StaticString = StaticString(),
-    end: StaticString = StaticString(),
-):
-    """
-    Use a buffer on the stack to minimize expensive calls to the writer. When
-    the buffer would overflow it writes to the `writer` passed in. You can also
-    add separators between the args, and end characters. The default stack space
-    used for the buffer is 4096 bytes which matches the default arm64 and x86-64
-    page size, you can modify this e.g. when writing a large amount of data to a
-    file.
-
-    Parameters:
-        W: The type of the `Writer` to write to.
-        Ts: The types of each arg to write. Each type must satisfy `Writable`.
-        buffer_size: How many bytes to write to a buffer before writing out to
-            the `writer` (default `4096`).
-        use_heap: Buffer to the heap, first calculating the total byte size
-            of all the args and then allocating only once. `buffer_size` is not
-            used in this case as it's dynamically calculated. (default `False`).
-
-    Args:
-        writer: The `Writer` to write to.
-        args: A VariadicPack of Writable arguments.
-        sep: The separator used between elements.
-        end: The String to write after printing the elements.
-
-    Example
-
-    ```mojo
-    import sys
-    from utils import write_buffered
-
-    fn print_err_buffered[*Ts: Writable](
-        *args: *Ts, sep: StaticString, end: StaticString
-    ):
-        var stderr = sys.stderr
-        write_buffered(stderr, args, sep=sep, end=end)
-
-        # Buffer before allocating a string
-        var string = String()
-        write_buffered(string, args, sep=sep, end=end)
-
-
-    print_err_buffered(3, "total", "args", sep=",", end="[end]")
-    ```
-
-    ```
-    3, total, args[end]
-    ```
-    .
-    """
-
-    @parameter
-    if use_heap:
-        # Count the total length of bytes to allocate only once
-        var arg_bytes = _TotalWritableBytes()
-        write_args(arg_bytes, args, sep=sep, end=end)
-
-        var buffer = _WriteBufferHeap(arg_bytes.size + 1)
-        write_args(buffer, args, sep=sep, end=end)
-        buffer.data[buffer.pos] = 0
-        writer.write_bytes(
-            Span[Byte, ImmutableAnyOrigin](ptr=buffer.data, length=buffer.pos)
-        )
-        buffer.data.free()
-    else:
-        var buffer = _WriteBufferStack[buffer_size](writer)
-        write_args(buffer, args, sep=sep, end=end)
-        buffer.flush()
-
-
-fn write_buffered[
-    W: Writer,
-    T: Copyable & Movable & Writable, //,
-    buffer_size: Int = 4096,
-](mut writer: W, values: List[T, *_], *, sep: StaticString = StaticString()):
-    """
-    Use a buffer on the stack to minimize expensive calls to the writer. You
-    can also add separators between the values. The default stack space used for
-    the buffer is 4096 bytes which matches the default arm64 and x86-64 page
-    size, you can modify this e.g. when writing a large amount of data to a
-    file.
-
-    Parameters:
-        W: The type of the `Writer` to write to.
-        T: The element type of the `List`. Must implement the `Writable`,
-            `Copyable` and `Movable` traits.
-        buffer_size: How many bytes to write to a buffer before writing out to
-            the `writer` (default `4096`).
-
-    Args:
-        writer: The `Writer` to write to.
-        values: A `List` of Writable arguments.
-        sep: The separator used between elements.
-
-    Example
-
-    ```mojo
-    import sys
-    from utils import write_buffered
-
-    var string = String()
-    var values = [String("3"), "total", "args"]
-    write_buffered(string, values, sep=",")
-    ```
-
-    ```
-    3, total, args
-    ```
-    .
-    """
-    var buffer = _WriteBufferStack(writer)
-    buffer.write_list(values, sep=sep)
-    buffer.flush()
-
-
-@fieldwise_init
-@register_passable
-struct WritableVariadicPack[
-    mut: Bool, //,
-    is_owned: Bool,
-    origin: Origin[mut],
-    pack_origin: Origin[mut],
-    *Ts: Writable,
-](Writable):
-    """Wraps a `VariadicPack`, enabling it to be passed to a writer along with
-    extra arguments.
-
-    Parameters:
-        mut: Whether the origin is mutable.
-        is_owned: Whether the `VariadicPack` owns its elements.
-        origin: The origin of the reference to the `VariadicPack`.
-        pack_origin: The origin of the `VariadicPack`.
-        Ts: The types of the variadic arguments conforming to `Writable`.
-
-    Example:
-
-    ```mojo
-    from utils.write import WritableVariadicPack
-
-    fn foo[*Ts: Writable](*messages: *Ts):
-        print("message:", WritableVariadicPack(messages), "[end]")
-
-    x = 42
-    foo("'x = ", x, "'")
-    ```
-
-    Output:
-
-    ```text
-    message: 'x = 42' [end]
-    ```
-    """
-
-    var value: Pointer[
-        VariadicPack[is_owned, pack_origin, Writable, *Ts], origin
-    ]
-    """Reference to a `VariadicPack` that conforms to `Writable`."""
-
-    fn __init__(
-        out self,
-        ref [origin]value: VariadicPack[is_owned, pack_origin, Writable, *Ts],
-    ):
-        """Initialize using a reference to the `VariadicPack`.
-
-        Args:
-            value: The `VariadicPack` to take a reference to.
-        """
-        self.value = Pointer(to=value)
-
-    fn write_to[W: Writer](self, mut writer: W):
-        """
-        Formats the string representation of all the arguments in the
-        `VariadicPack` to the provided `Writer`.
-
-        Parameters:
-            W: A type conforming to the Writable trait.
-
-        Args:
-            writer: The type conforming to `Writable`.
-        """
-        write_args(writer, self.value[])
 
 
 # ===-----------------------------------------------------------------------===#
@@ -563,16 +344,9 @@ fn _hex_digits_to_hex_chars(ptr: UnsafePointer[Byte], decimal: Scalar):
     ```
     .
     """
-
     alias size = decimal.dtype.sizeof()
-    var data: SIMD[DType.uint8, size]
-
-    @parameter
-    if size == 1:
-        data = bitcast[DType.uint8, size](decimal)
-    else:
-        data = bitcast[DType.uint8, size](byte_swap(decimal))
-    var nibbles = (data >> 4).interleave(data & 0xF)
+    var bytes = bitcast[DType.uint8, size](byte_swap(decimal))
+    var nibbles = (bytes >> 4).interleave(bytes & 0xF)
     ptr.store(_hex_table._dynamic_shuffle(nibbles))
 
 

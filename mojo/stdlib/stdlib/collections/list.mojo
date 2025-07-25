@@ -20,7 +20,7 @@ from os import abort
 from sys import sizeof
 from sys.intrinsics import _type_is_eq
 
-from memory import Pointer, Span, UnsafePointer, memcpy
+from memory import Pointer, memcpy
 
 from .optional import Optional
 
@@ -36,7 +36,7 @@ struct _ListIter[
     hint_trivial_type: Bool,
     list_origin: Origin[list_mutability],
     forward: Bool = True,
-](Copyable, Movable):
+](Copyable, Iterator, Movable):
     """Iterator for List.
 
     Parameters:
@@ -48,15 +48,21 @@ struct _ListIter[
         forward: The iteration direction. `False` is backwards.
     """
 
+    alias Element = T  # FIXME(MOCO-2068): shouldn't be needed.
     alias list_type = List[T, hint_trivial_type]
 
     var index: Int
     var src: Pointer[Self.list_type, list_origin]
 
-    fn __iter__(self) -> Self:
-        return self
+    @always_inline
+    fn __has_next__(self) -> Bool:
+        @parameter
+        if forward:
+            return self.index < len(self.src[])
+        else:
+            return self.index > 0
 
-    fn __next__(mut self) -> ref [list_origin] T:
+    fn __next_ref__(mut self) -> ref [list_origin] T:
         @parameter
         if forward:
             self.index += 1
@@ -66,23 +72,16 @@ struct _ListIter[
             return self.src[][self.index]
 
     @always_inline
-    fn __has_next__(self) -> Bool:
-        return self.__len__() > 0
+    fn __next__(mut self) -> T:
+        return self.__next_ref__()
 
-    fn __len__(self) -> Int:
-        @parameter
-        if forward:
-            return len(self.src[]) - self.index
-        else:
-            return self.index
+    @always_inline
+    fn __iter__(self) -> Self:
+        return self
 
 
 struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
-    Boolable,
-    Copyable,
-    Movable,
-    ExplicitlyCopyable,
-    Sized,
+    Boolable, Copyable, Defaultable, ExplicitlyCopyable, Movable, Sized
 ):
     """The `List` type is a dynamically-allocated list.
 
@@ -97,7 +96,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
     """
 
     # Fields
-    var data: UnsafePointer[T]
+    var _data: UnsafePointer[T]
     """The underlying storage for the list."""
     var _len: Int
     """The number of elements in the list."""
@@ -110,7 +109,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
 
     fn __init__(out self):
         """Constructs an empty list."""
-        self.data = UnsafePointer[T]()
+        self._data = UnsafePointer[T]()
         self._len = 0
         self.capacity = 0
 
@@ -121,7 +120,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
             A copy of the value.
         """
         var copy = Self(capacity=self.capacity)
-        for ref e in self:
+        for e in self:
             copy.append(e)
         return copy^
 
@@ -132,9 +131,9 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
             capacity: The requested capacity of the list.
         """
         if capacity:
-            self.data = UnsafePointer[T].alloc(capacity)
+            self._data = UnsafePointer[T].alloc(capacity)
         else:
-            self.data = UnsafePointer[T]()
+            self._data = UnsafePointer[T]()
         self._len = 0
         self.capacity = capacity
 
@@ -146,10 +145,10 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
             fill: The element to fill each element of the list.
         """
         self = Self()
-        self.resize(length, fill)
+        self.resize(Int(length), fill)
 
     @always_inline
-    fn __init__(out self, owned *values: T, __list_literal__: () = ()):
+    fn __init__(out self, var *values: T, __list_literal__: () = ()):
         """Constructs a list from the given values.
 
         Args:
@@ -158,7 +157,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         """
         self = Self(elements=values^)
 
-    fn __init__(out self, *, owned elements: VariadicListMem[T, _]):
+    fn __init__(out self, *, var elements: VariadicListMem[T, _]):
         """Constructs a list from the given values.
 
         Args:
@@ -170,7 +169,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
 
         for i in range(length):
             var src = UnsafePointer(to=elements[i])
-            var dest = self.data + i
+            var dest = self._data + i
 
             src.move_pointee_into(dest)
 
@@ -186,7 +185,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
             span: The span of values to populate the list with.
         """
         self = Self(capacity=len(span))
-        for ref value in span:
+        for value in span:
             self.append(value)
 
     @always_inline
@@ -209,8 +208,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
             existing: The list to copy.
         """
         self = Self(capacity=existing.capacity)
-        for i in range(len(existing)):
-            self.append(existing[i])
+        self.extend(Span(existing))
 
     fn __del__(owned self):
         """Destroy all elements in the list and free its memory."""
@@ -218,8 +216,8 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         @parameter
         if not hint_trivial_type:
             for i in range(len(self)):
-                (self.data + i).destroy_pointee()
-        self.data.free()
+                (self._data + i).destroy_pointee()
+        self._data.free()
 
     # ===-------------------------------------------------------------------===#
     # Operator dunders
@@ -252,7 +250,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         if len(self) != len(other):
             return False
         var index = 0
-        for ref element in self:
+        for element in self:
             if element != other[index]:
                 return False
             index += 1
@@ -306,7 +304,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         print("x contains 3" if 3 in x else "x does not contain 3")
         ```
         """
-        for ref i in self:
+        for i in self:
             if i == value:
                 return True
         return False
@@ -347,7 +345,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         for _ in range(x - 1):
             self.extend(orig)
 
-    fn __add__(self, owned other: Self) -> Self:
+    fn __add__(self, var other: Self) -> Self:
         """Concatenates self with other and returns the result as a new list.
 
         Args:
@@ -361,7 +359,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         result.extend(other^)
         return result^
 
-    fn __iadd__(mut self, owned other: Self):
+    fn __iadd__(mut self, var other: Self):
         """Appends the elements of other into self.
 
         Args:
@@ -507,17 +505,17 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
 
         @parameter
         if hint_trivial_type:
-            memcpy(new_data, self.data, len(self))
+            memcpy(new_data, self._data, len(self))
         else:
             for i in range(len(self)):
-                (self.data + i).move_pointee_into(new_data + i)
+                (self._data + i).move_pointee_into(new_data + i)
 
-        if self.data:
-            self.data.free()
-        self.data = new_data
+        if self._data:
+            self._data.free()
+        self._data = new_data
         self.capacity = new_capacity
 
-    fn append(mut self, owned value: T):
+    fn append(mut self, var value: T):
         """Appends a value to this list.
 
         Args:
@@ -532,30 +530,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         self._unsafe_next_uninit_ptr().init_pointee_move(value^)
         self._len += 1
 
-    fn append(mut self, elements: Span[T, _]):
-        """Appends elements to this list.
-
-        Args:
-            elements: The elements to append.
-        """
-        var elements_len = len(elements)
-        var new_num_elts = self._len + elements_len
-        if new_num_elts > self.capacity:
-            # Make sure our capacity at least doubles to avoid O(n^2) behavior.
-            self._realloc(max(self.capacity * 2, new_num_elts))
-
-        var i = self._len
-        self._len = new_num_elts
-
-        @parameter
-        if hint_trivial_type:
-            memcpy(self.data + i, elements.unsafe_ptr(), elements_len)
-        else:
-            for ref elt in elements:
-                UnsafePointer(to=self[i]).init_pointee_copy(elt)
-                i += 1
-
-    fn insert(mut self, i: Int, owned value: T):
+    fn insert(mut self, i: Int, var value: T):
         """Inserts a value to the list at the given index.
         `a.insert(len(a), value)` is equivalent to `a.append(value)`.
 
@@ -574,8 +549,8 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         self.append(value^)
 
         for _ in range(normalized_idx, len(self) - 1):
-            var earlier_ptr = self.data + earlier_idx
-            var later_ptr = self.data + later_idx
+            var earlier_ptr = self._data + earlier_idx
+            var later_ptr = self._data + later_idx
 
             var tmp = earlier_ptr.take_pointee()
             later_ptr.move_pointee_into(earlier_ptr)
@@ -584,7 +559,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
             earlier_idx -= 1
             later_idx -= 1
 
-    fn extend(mut self, owned other: List[T, *_]):
+    fn extend(mut self, var other: List[T, *_]):
         """Extends this list by consuming the elements of `other`.
 
         Args:
@@ -596,7 +571,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         var final_size = len(self) + other_len
         self.reserve(final_size)
 
-        var dest_ptr = self.data + self._len
+        var dest_ptr = self._data + self._len
         var src_ptr = other.unsafe_ptr()
 
         @parameter
@@ -618,13 +593,38 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         # they don't get destroyed when it goes out of scope.
         other._len = 0
 
+    fn extend(mut self, elements: Span[T, _]):
+        """Extend this list by copying elements from a `Span`.
+
+        The resulting list will have the length `len(self) + len(elements)`.
+
+        Args:
+            elements: The elements to copy into this list.
+        """
+        var elements_len = len(elements)
+        var new_num_elts = self._len + elements_len
+        if new_num_elts > self.capacity:
+            # Make sure our capacity at least doubles to avoid O(n^2) behavior.
+            self._realloc(max(self.capacity * 2, new_num_elts))
+
+        var i = self._len
+        self._len = new_num_elts
+
+        @parameter
+        if hint_trivial_type:
+            memcpy(self.unsafe_ptr() + i, elements.unsafe_ptr(), elements_len)
+        else:
+            for elt in elements:
+                UnsafePointer(to=self[i]).init_pointee_copy(elt)
+                i += 1
+
     fn extend[
-        D: DType, //
-    ](mut self: List[Scalar[D], *_, **_], value: SIMD[D, _]):
+        dtype: DType, //
+    ](mut self: List[Scalar[dtype], *_, **_], value: SIMD[dtype, _]):
         """Extends this list with the elements of a vector.
 
         Parameters:
-            D: The DType.
+            dtype: The DType.
 
         Args:
             value: The value to append.
@@ -637,16 +637,21 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         self._len += value.size
 
     fn extend[
-        D: DType, //
-    ](mut self: List[Scalar[D], *_, **_], value: SIMD[D, _], *, count: Int):
+        dtype: DType, //
+    ](
+        mut self: List[Scalar[dtype], *_, **_],
+        value: SIMD[dtype, _],
+        *,
+        count: Int,
+    ):
         """Extends this list with `count` number of elements from a vector.
 
         Parameters:
-            D: The DType.
+            dtype: The DType.
 
         Args:
             value: The value to append.
-            count: The ammount of items to append. Must be less than or equal to
+            count: The amount of items to append. Must be less than or equal to
                 `value.size`.
 
         Notes:
@@ -654,17 +659,17 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         """
         debug_assert(count <= value.size, "count must be <= value.size")
         self.reserve(self._len + count)
-        var v_ptr = UnsafePointer(to=value).bitcast[Scalar[D]]()
+        var v_ptr = UnsafePointer(to=value).bitcast[Scalar[dtype]]()
         memcpy(self._unsafe_next_uninit_ptr(), v_ptr, count)
         self._len += count
 
     fn extend[
-        D: DType, //
-    ](mut self: List[Scalar[D], *_, **_], value: Span[Scalar[D]]):
+        dtype: DType, //
+    ](mut self: List[Scalar[dtype], *_, **_], value: Span[Scalar[dtype]]):
         """Extends this list with the elements of a `Span`.
 
         Parameters:
-            D: The DType.
+            dtype: The DType.
 
         Args:
             value: The value to append.
@@ -691,9 +696,9 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         if i < 0:
             normalized_idx += self._len
 
-        var ret_val = (self.data + normalized_idx).take_pointee()
+        var ret_val = (self._data + normalized_idx).take_pointee()
         for j in range(normalized_idx + 1, self._len):
-            (self.data + j).move_pointee_into(self.data + j - 1)
+            (self._data + j).move_pointee_into(self._data + j - 1)
         self._len -= 1
 
         return ret_val^
@@ -729,7 +734,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         else:
             self.reserve(new_size)
             for i in range(self._len, new_size):
-                (self.data + i).init_pointee_copy(value)
+                (self._data + i).init_pointee_copy(value)
             self._len = new_size
 
     fn resize(mut self, *, unsafe_uninit_length: Int):
@@ -770,7 +775,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         @parameter
         if not hint_trivial_type:
             for i in range(new_size, len(self)):
-                (self.data + i).destroy_pointee()
+                (self._data + i).destroy_pointee()
         self._len = new_size
         self.reserve(new_size)
 
@@ -784,8 +789,8 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         var half_len = effective_len // 2
 
         for _ in range(half_len):
-            var earlier_ptr = self.data + earlier_idx
-            var later_ptr = self.data + later_idx
+            var earlier_ptr = self._data + earlier_idx
+            var later_ptr = self._data + later_idx
 
             var tmp = earlier_ptr.take_pointee()
             later_ptr.move_pointee_into(earlier_ptr)
@@ -869,7 +874,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
             sorted in ascending order.
         """
         var cursor = UInt(0)
-        var b = self.data
+        var b = self._data
         var length = len(self)
         while length > 1:
             var half = length >> 1
@@ -881,7 +886,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
     fn clear(mut self):
         """Clears the elements in the list."""
         for i in range(self._len):
-            (self.data + i).destroy_pointee()
+            (self._data + i).destroy_pointee()
         self._len = 0
 
     fn steal_data(mut self) -> UnsafePointer[T]:
@@ -890,8 +895,8 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         Returns:
             The underlying data.
         """
-        var ptr = self.data
-        self.data = UnsafePointer[T]()
+        var ptr = self._data
+        self._data = UnsafePointer[T]()
         self._len = 0
         self.capacity = 0
         return ptr
@@ -905,11 +910,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
         Returns:
             A new list containing the list at the specified slice.
         """
-
-        var start: Int
-        var end: Int
-        var step: Int
-        start, end, step = slice.indices(len(self))
+        var start, end, step = slice.indices(len(self))
         var r = range(start, end, step)
 
         if not len(r):
@@ -936,7 +937,15 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
 
         @parameter
         if _type_is_eq[I, UInt]():
-            return (self.data + idx)[]
+            var idx = UInt(idx)
+            debug_assert(
+                idx < self._len,
+                "index: ",
+                idx,
+                " is out of bounds for `List` of length: ",
+                self._len,
+            )
+            return (self._data + idx)[]
         else:
             var normalized_idx = Int(idx)
             debug_assert(
@@ -949,7 +958,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
             if normalized_idx < 0:
                 normalized_idx += len(self)
 
-            return (self.data + normalized_idx)[]
+            return (self._data + normalized_idx)[]
 
     @always_inline
     fn unsafe_get(ref self, idx: Int) -> ref [self] Self.T:
@@ -978,10 +987,10 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
                 " when using List.unsafe_get()"
             ),
         )
-        return (self.data + idx)[]
+        return (self._data + idx)[]
 
     @always_inline
-    fn unsafe_set(mut self, idx: Int, owned value: T):
+    fn unsafe_set(mut self, idx: Int, var value: T):
         """Write a value to a given location without checking index bounds.
 
         Args:
@@ -1005,8 +1014,8 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
                 " when using List.unsafe_set()"
             ),
         )
-        (self.data + idx).destroy_pointee()
-        (self.data + idx).init_pointee_move(value^)
+        (self._data + idx).destroy_pointee()
+        (self._data + idx).init_pointee_move(value^)
 
     fn count[
         T: EqualityComparable & Copyable & Movable, //
@@ -1024,7 +1033,7 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
             The number of occurrences of the value in the list.
         """
         var count = 0
-        for ref elem in self:
+        for elem in self:
             if elem == value:
                 count += 1
         return count
@@ -1056,22 +1065,24 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
             ),
         )
         if elt_idx_1 != elt_idx_2:
-            swap((self.data + elt_idx_1)[], (self.data + elt_idx_2)[])
+            swap((self._data + elt_idx_1)[], (self._data + elt_idx_2)[])
 
-    fn unsafe_ptr(
-        ref self,
-    ) -> UnsafePointer[
-        T,
-        mut = Origin(__origin_of(self)).mut,
-        origin = __origin_of(self),
+    fn unsafe_ptr[
+        origin: Origin, address_space: AddressSpace, //
+    ](ref [origin, address_space]self) -> UnsafePointer[
+        T, mut = origin.mut, origin=origin, address_space=address_space
     ]:
         """Retrieves a pointer to the underlying memory.
+
+        Parameters:
+            origin: The origin of the `List`.
+            address_space: The `AddressSpace` of the `List`.
 
         Returns:
             The pointer to the underlying memory.
         """
-        return self.data.origin_cast[
-            mut = Origin(__origin_of(self)).mut, origin = __origin_of(self)
+        return self._data.origin_cast[origin.mut, origin]().address_space_cast[
+            address_space
         ]()
 
     @always_inline
@@ -1113,9 +1124,9 @@ struct List[T: Copyable & Movable, hint_trivial_type: Bool = False](
 
     fn _cast_hint_trivial_type[
         hint_trivial_type: Bool
-    ](owned self) -> List[T, hint_trivial_type]:
+    ](var self) -> List[T, hint_trivial_type]:
         var result = List[T, hint_trivial_type]()
-        result.data = self.data
+        result._data = self._data
         result._len = self._len
         result.capacity = self.capacity
 

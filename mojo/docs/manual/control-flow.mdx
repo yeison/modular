@@ -252,9 +252,7 @@ The following shows an example of iterating over a Mojo
 [`List`](/mojo/stdlib/collections/list/List).
 
 ```mojo
-from collections import List
-
-states = [String("California"), "Hawaii", "Oregon"]
+states = ["California", "Hawaii", "Oregon"]
 for state in states:
     print(state)
 ```
@@ -323,8 +321,9 @@ Salem, Oregon
 
 The Mojo collection iterators all return
 [references](/mojo/manual/values/lifetimes#working-with-references), which
-are copied into the loop variable. To avoid making a copy, add the `ref`
-keyword in front of the loop variable to create a reference binding.
+are captured immutably into the loop variable. If you'd like to get a reference
+to a mutable element, add the `ref` keyword in front of the loop variable to
+create a reference binding that matches the element reference.
 
 This can be useful if you want to mutate the value in the collection:
 
@@ -408,7 +407,7 @@ The `else` clause executes even if the collection is empty.
 ```mojo
 from collections import List
 
-empty = List[Int]()
+var empty: List[Int] = []
 for i in empty:
     print(i)
 else:
@@ -429,7 +428,7 @@ terminates the `for` loop.
 ```mojo
 from collections import List
 
-animals = [String("cat"), "aardvark", "hippopotamus", "dog"]
+animals = ["cat", "aardvark", "hippopotamus", "dog"]
 for animal in animals:
     if animal == "dog":
         print("Found a dog")

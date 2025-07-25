@@ -10,7 +10,7 @@ high-performance computing, you shouldn't have to rewrite the whole thing in
 Mojo. Instead, you can write just the performance-critical parts your code in
 Mojo and then call it from Python.
 
-:::caution Early preview
+:::experiment Beta feature
 
 Calling Mojo code from Python is in early development. You should expect a lot
 of changes to the API and ergonomics. Likewise, this documentation is still a
@@ -89,8 +89,7 @@ On the Python side, we currently need some more boilerplate code to make it
 work (but this will improve soon):
 
 ```python title="main.py"
-import max._mojo.mojo_importer
-import os
+import max.mojo.importer
 import sys
 
 sys.path.insert(0, "")
@@ -120,7 +119,7 @@ from Python in an intuitive way. Concretely, a Python extension module is
 simply a dynamic library that defines a suitable `PyInit_*()` function.
 
 Mojo comes with built-in functionality for defining Python extension modules.
-The special stuff happens in the `max._mojo.mojo_importer` module we imported.
+The special stuff happens in the `max.mojo.importer` module we imported.
 
 If we have a look at the filesystem after Python imports the Mojo code, we'll
 notice there's a new `__mojocache__` directory, with dynamic library (`.so`)
@@ -134,7 +133,7 @@ project
     └── mojo_module.hash-ABC123.so
 ```
 
-Loading `max._mojo.mojo_importer` loads our Python Mojo [import
+Loading `max.mojo.importer` loads our Python Mojo [import
 hook](https://docs.python.org/3/reference/import.html#import-hooks), which
 behind the scenes looks for a `.mojo` (or `.🔥`) file that matches the imported
 module name, and if found, compiles it using [`mojo build --emit
@@ -148,7 +147,7 @@ your Python with Mojo.
 
 ## Binding Mojo types
 
-All Mojo type are eligible to be bound for use from Python.
+All Mojo types are eligible to be bound for use from Python.
 
 :::note
 
@@ -215,7 +214,7 @@ object type had not previously been registered using
 {/*
 TODO: How to distinguish this constructor from the converting constructor?
 TODO: Maybe `PythonObject.mojo()` / `PythonObject(mojo_object=)`?
-TODO: `PythonObject.__init__[T: AnyType](out self, *, owned alloc: T)
+TODO: `PythonObject.__init__[T: AnyType](out self, *, var alloc: T)
 */}
 
 
@@ -231,7 +230,7 @@ TODO: What is this directory, when is it created, what artifacts are stored in
 Within any Mojo code that is handling a
 [`PythonObject`](/mojo/stdlib/python/python_object/PythonObject), but
 especially within Mojo functions called from Python, it's common to expect an
-argument of a particular type. particular type and wish
+argument of a particular type.
 
 There are two scenarios where a `PythonObject` can be "converted" into a native
 Mojo value:
@@ -355,30 +354,28 @@ fn foo(x: PythonObject, y: PythonObject, z: PythonObject) -> PythonObject:
 
 ## Keyword arguments
 
-Keyword arguments are not currently supported natively in Python Mojo bindings,
-but a simple pattern can be used to provide them to users of your library, using
-a Python wrapper function that passes keyword arguments into Mojo using a dict.
+You can define Mojo functions that accept keyword arguments using
+[`OwnedKwargsDict[PythonObject]`](/mojo/stdlib/collections/dict/OwnedKwargsDict) as the last argument.
 
-A simple example of this pattern looks like:
+A simple example looks like:
 
 ```python
 import mojo_module
 
-def supports_kwargs(pos, *, kw1 = None, kw2 = None):
-    mojo_module.supports_kwargs(pos, { "kw1": kw1, "kw2": kw2})
+result = mojo_module.sum_kwargs_ints(a=10, b=20, c=30)  # returns 60
 ```
 
 ```mojo
-fn supports_kwargs(pos: PythonObject, kwargs: PythonObject) raises:
-    var kw1 = kwargs["kw1"]
-    var kw2 = kwargs["kw2"]
+from collections import OwnedKwargsDict
+
+ def sum_kwargs_ints(kwargs: OwnedKwargsDict[PythonObject]) -> PythonObject:
+    var total = 0
+    for entry in kwargs.items():
+        total += Int(entry.value)
+    return PythonObject(total)
 ```
 
-Because keyword argument validation and default values are handled within the
-Python wrapper function, callers will get the standard argument errors they
-expect.
-And the Mojo code stays simple, as getting the keyword argument is a simple
-dictionary lookup.
+Getting keyword arguments is a dictionary lookup on the `OwnedKwargsDict`.
 
 ## Variadic functions
 

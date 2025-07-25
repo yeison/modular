@@ -21,7 +21,7 @@ from memory import memcmp
 
 
 from collections.string.string_slice import _get_kgen_string
-from math import align_down, iota
+from math import iota
 from sys import _libc as libc
 from sys import (
     alignof,
@@ -146,7 +146,7 @@ fn memcmp[
     var byte_count = count * sizeof[type]()
 
     @parameter
-    if sizeof[type]() >= sizeof[DType.int32]():
+    if sizeof[type]() % sizeof[DType.int32]() == 0:
         return _memcmp_impl(
             s1.bitcast[Int32](),
             s2.bitcast[Int32](),

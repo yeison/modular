@@ -32,7 +32,6 @@ Key Components:
   various configurations for different tensor shapes and memory access patterns.
 """
 
-from collections import Optional
 from sys import alignof, llvm_intrinsic, simdwidthof, sizeof
 from sys._assembly import inlined_assembly
 
@@ -43,7 +42,6 @@ from gpu.host._nvidia_cuda import (
     create_tma_descriptor,
     prefetch_tma_descriptor,
 )
-from gpu.id import block_idx, thread_idx
 from gpu.memory import (
     AddressSpace,
     ReduceOp,
@@ -58,15 +56,13 @@ from gpu.sync import (
     cp_async_bulk_wait_group,
     mbarrier_arrive,
     mbarrier_arrive_expect_tx_shared,
+    mbarrier_arrive_expect_tx_relaxed,
     mbarrier_init,
-    mbarrier_try_wait_parity_shared,
 )
 from layout import IntTuple, Layout, LayoutTensor
-from memory import UnsafePointer, stack_allocation
 from memory.pointer import _GPUAddressSpace
-
+from gpu.intrinsics import Scope
 from utils.index import Index, IndexList
-from utils.static_tuple import StaticTuple
 
 
 # Returns an IntTuple of variadic Int values.
@@ -139,7 +135,6 @@ fn _tma_desc_tile_layout[
         )
 
 
-@value
 @register_passable("trivial")
 struct SharedMemBarrier(Copyable, Movable):
     """A hardware-accelerated synchronization primitive for GPU shared memory operations.
@@ -195,6 +190,56 @@ struct SharedMemBarrier(Copyable, Movable):
         """
         mbarrier_arrive_expect_tx_shared(self.unsafe_ptr(), bytes)
 
+    @always_inline
+    fn expect_bytes_relaxed(
+        ref [AddressSpace.SHARED]self, bytes: Int32
+    ) -> UInt64:
+        """Configure the barrier to expect a specific number of bytes to be transferred.
+
+        Used with TMA operations to indicate the expected size of data transfer.
+        The barrier will be satisfied when the specified number of bytes has been
+        transferred, enabling efficient coordination of memory operations.
+
+        Args:
+            bytes: Number of bytes expected to be transferred.
+
+        Returns:
+            The state.
+        """
+        return mbarrier_arrive_expect_tx_relaxed(self.unsafe_ptr(), bytes)
+
+    @always_inline
+    fn arrive_and_expect_bytes(
+        ref [AddressSpace.SHARED]self,
+        bytes: Int32,
+        cta_id: UInt32,
+        pred: UInt32,
+    ):
+        """Configure the barrier to expect a specific number to bytes to be transferred
+        at a remote CTA.
+
+         Used with TMA operations to indicate the expected size of data transfer.
+         The barrier will be satisfied when the specified number of bytes has been
+         transferred at the specified CTA in the cluster.
+
+        Args:
+            bytes: Number of bytes expected to be transferred.
+            cta_id: The CTA ID in a cluster to configure an arrival.
+            pred: Predication on the arrival configuration instruction. Use UInt32 to match `selp.u32` in ptx.
+        """
+
+        alias asm = """
+        .reg .pred p;
+        .reg .b32 remAddr32;
+        setp.eq.u32 p, $2, 1;
+        @p mapa.shared::cluster.u32  remAddr32, $0, $1;
+        @p mbarrier.arrive.expect_tx.shared::cluster.b64  _, [remAddr32], $3;
+        """
+
+        inlined_assembly[asm, NoneType, constraints="r,r,r,r"](
+            Int32(Int(self.unsafe_ptr())), cta_id, pred, bytes
+        )
+
     @always_inline("nodebug")
     fn wait(ref [AddressSpace.SHARED]self, phase: UInt32 = 0):
         """Wait until the barrier is satisfied.
@@ -222,6 +267,96 @@ struct SharedMemBarrier(Copyable, Movable):
             bra LAB_WAIT;
             DONE:
         }"""
+        inlined_assembly[asm, NoneType, constraints="r,r"](
+            Int32(Int(self.unsafe_ptr())), phase
+        )
+
+    @always_inline("nodebug")
+    fn wait_acquire[
+        scope: Scope
+    ](ref [AddressSpace.SHARED]self, phase: UInt32 = 0):
+        """Acquire and wait until the barrier is satisfied.
+
+        Blocks the calling thread until the barrier is satisfied, either by
+        the expected number of threads arriving or the expected data transfer
+        completing. This method implements an efficient spin-wait mechanism
+        optimized for GPU execution.
+
+        Parameters:
+            scope: The scope of the barrier.
+
+        Args:
+            phase: The phase value to check against. Defaults to 0.
+
+        Note:
+            Minimizes thread divergence during synchronization by using
+            hardware-accelerated barrier instructions.
+        """
+        # Based on cccl
+        # https://github.com/NVIDIA/cccl/blob/ba510b38e01dac5ab9b5faad9b9b1701d60d9980/libcudacxx/include/cuda/__ptx/instructions/generated/mbarrier_try_wait_parity.h#L94
+
+        constrained[
+            scope == Scope.CLUSTER or scope == Scope.BLOCK,
+            "wait_acquire is only supported for cluster or block/CTA scope.",
+        ]()
+
+        alias asm = (
+            """{
+            .reg .pred P1;
+            LAB_WAIT:
+            mbarrier.try_wait.parity.acquire."""
+            + scope.mnemonic()
+            + """.shared::cta.b64 P1, [$0], $1;
+            @P1 bra DONE;
+            bra LAB_WAIT;
+            DONE:
+            }"""
+        )
+        inlined_assembly[asm, NoneType, constraints="r,r"](
+            Int32(Int(self.unsafe_ptr())), phase
+        )
+
+    @always_inline("nodebug")
+    fn wait_relaxed[
+        scope: Scope
+    ](ref [AddressSpace.SHARED]self, phase: UInt32 = 0):
+        """Wait until the barrier is satisfied with relaxed ordering.
+
+        Blocks the calling thread until the barrier is satisfied, either by
+        the expected number of threads arriving or the expected data transfer
+        completing. This method implements an efficient spin-wait mechanism
+        optimized for GPU execution.
+
+        Parameters:
+            scope: The scope of the barrier.
+
+        Args:
+            phase: The phase value to check against. Defaults to 0.
+
+        Note:
+            Minimizes thread divergence during synchronization by using
+            hardware-accelerated barrier instructions.
+        """
+        # Based on cccl
+        # https://github.com/NVIDIA/cccl/blob/ba510b38e01dac5ab9b5faad9b9b1701d60d9980/libcudacxx/include/cuda/__ptx/instructions/generated/mbarrier_try_wait_parity.h#L104
+
+        constrained[
+            scope == Scope.CLUSTER or scope == Scope.BLOCK,
+            "wait_relaxed is only supported for cluster or block/CTA scope.",
+        ]()
+
+        alias asm = (
+            """{
+            .reg .pred P1;
+            LAB_WAIT:
+            mbarrier.try_wait.parity.relaxed."""
+            + scope.mnemonic()
+            + """.shared::cta.b64 P1, [$0], $1;
+            @P1 bra DONE;
+            bra LAB_WAIT;
+            DONE:
+            }"""
+        )
         inlined_assembly[asm, NoneType, constraints="r,r"](
             Int32(Int(self.unsafe_ptr())), phase
         )
@@ -286,9 +421,8 @@ struct SharedMemBarrier(Copyable, Movable):
         return mbarrier_arrive(self.unsafe_ptr())
 
 
-@value
 @register_passable("trivial")
-struct PipelineState[num_stages: Int]:
+struct PipelineState[num_stages: Int](Copyable, Defaultable, Movable):
     """Manages state for a multi-stage pipeline with circular buffer semantics.
 
     PipelineState provides a mechanism for tracking the current stage in a
@@ -396,12 +530,11 @@ struct PipelineState[num_stages: Int]:
 # TMATensorTile is created on the host with specific memory and tile sizes.
 # Each TMATensorTile provides an asynchronous load of a specific tile at specified tile coordinates.
 #
-@value
 struct TMATensorTile[
     dtype: DType,
     layout: Layout,
     desc_layout: Layout = layout,
-]:
+](Copyable, Movable):
     """
     A hardware-accelerated tensor memory access (TMA) tile for efficient asynchronous data movement.
 
@@ -470,7 +603,9 @@ struct TMATensorTile[
         prefetch_tma_descriptor(desc_ptr)
 
     @always_inline
-    fn async_copy(
+    fn async_copy[
+        cta_group: Int = 1
+    ](
         self,
         dst: LayoutTensor[
             dtype, _, address_space = AddressSpace.SHARED, *_, **_
@@ -484,6 +619,11 @@ struct TMATensorTile[
         This method initiates a hardware-accelerated asynchronous transfer of data from global memory
         to the specified destination in shared memory. The transfer is tracked by the provided memory
         barrier.
+
+        Parameters:
+            cta_group: Int
+                If the TMA is issued with cta_group == 2, only the leader CTA needs
+                to be notified upon completion.
 
         Args:
             dst: The destination tensor in shared memory where data will be copied.
@@ -524,7 +664,7 @@ struct TMATensorTile[
             for j in range(num_copies_dim1):
                 alias copy_offset = (i * num_copies_dim1 + j) * copy_size
 
-                cp_async_bulk_tensor_shared_cluster_global(
+                cp_async_bulk_tensor_shared_cluster_global[cta_group=cta_group](
                     dst.ptr + copy_offset,
                     UnsafePointer(to=self.descriptor).bitcast[NoneType](),
                     mem_barrier.unsafe_ptr(),
@@ -605,7 +745,9 @@ struct TMATensorTile[
                     )
 
     @always_inline
-    fn async_multicast_load(
+    fn async_multicast_load[
+        cta_group: Int = 1
+    ](
         self,
         dst: LayoutTensor[
             dtype, _, address_space = AddressSpace.SHARED, *_, **_
@@ -620,6 +762,11 @@ struct TMATensorTile[
         This method initiates a hardware-accelerated asynchronous transfer of data from global memory
         to multiple destination locations in shared memory across different CTAs (Cooperative Thread Arrays)
         as specified by the multicast mask.
+
+        Parameters:
+            cta_group: Int
+                If the TMA is issued with cta_group == 2, only the leader CTA needs
+                to be notified upon completion.
 
         Args:
             dst: LayoutTensor
@@ -654,7 +801,9 @@ struct TMATensorTile[
             for j in range(num_copies_dim1):
                 alias copy_offset = (i * num_copies_dim1 + j) * copy_size
 
-                cp_async_bulk_tensor_shared_cluster_global_multicast(
+                cp_async_bulk_tensor_shared_cluster_global_multicast[
+                    cta_group=cta_group
+                ](
                     dst.ptr + copy_offset,
                     UnsafePointer(to=self.descriptor).bitcast[NoneType](),
                     mem_barrier.unsafe_ptr(),
@@ -1366,14 +1515,68 @@ def create_tma_tile[
         )
 
 
-@value
+@always_inline
+def create_tma_tile_template[
+    type: DType,
+    rank: Int,
+    tile_shape: IndexList[rank],
+    /,
+    is_k_major: Bool = True,
+    swizzle_mode: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_NONE,
+    *,
+    __tile_layout: Layout = Layout.row_major(tile_shape[0], tile_shape[1]),
+    __desc_layout: Layout = _tma_desc_tile_layout[
+        type, rank, tile_shape, is_k_major, swizzle_mode
+    ](),
+]() -> TMATensorTile[type, __tile_layout, __desc_layout]:
+    """
+    Same as create_tma_tile expect the descriptor is only a placeholder or a template for later replacement.
+
+    specification of data type, rank, and layout orientation. It supports both 2D and 3D
+    tensors and provides fine-grained control over the memory access patterns.
+
+    Parameters:
+        type: DType
+            The data type of the tensor elements.
+        rank: Int
+            The dimensionality of the tensor (must be 2 or 3).
+        tile_shape: IndexList[rank]
+            The shape of the tile to be transferred.
+        is_k_major: Bool = True
+            Whether the tensor layout is K-major (True) or MN-major (False).
+            K-major is typically used for weight matrices, while MN-major is used for
+            activation matrices in matrix multiplication operations.
+        swizzle_mode: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_NONE
+            The swizzling mode to use for memory access optimization.
+        __tile_layout: Layout = Layout.row_major(tile_shape[0], tile_shape[1])
+            Internal parameter for the tile layout in shared memory.
+        __desc_layout: Layout = _tma_desc_tile_layout[...]
+            Internal parameter for the descriptor layout, which may differ from the
+            tile layout to accommodate hardware requirements.
+
+    Returns:
+        A `TMATensorTile` configured with the specified parameters, ready for use in
+        asynchronous data transfer operations.
+
+    Constraints:
+
+        - Only supports 2D and 3D tensors (rank must be 2 or 3).
+        - For non-SWIZZLE_NONE modes, the K dimension size in bytes must be a multiple
+          of the swizzle mode's byte size.
+        - For MN-major layout, only SWIZZLE_128B is supported.
+        - For 3D tensors, only K-major layout is supported.
+    """
+
+    return TMATensorTile[type, __tile_layout, __desc_layout](TMADescriptor())
+
+
 @register_passable("trivial")
 struct TMATensorTileArray[
     num_of_tensormaps: Int,
     dtype: DType,
     cta_tile_layout: Layout,
     desc_layout: Layout,
-]:
+](Copyable, Movable):
     """An array of TMA descripotr.
 
     Parameters:

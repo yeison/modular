@@ -10,12 +10,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-from collections.string.string_slice import StringSlice
-from sys import has_amd_gpu_accelerator, has_nvidia_gpu_accelerator, sizeof
-from sys.ffi import OpaquePointer, _get_global_or_null, external_call
+from sys import has_amd_gpu_accelerator, sizeof
+from sys.ffi import _get_global_or_null, external_call
 
 import gpu._rocblas
-from buffer import DimList, NDBuffer
+from buffer import NDBuffer
 from gpu._cublas.cublas import (
     Algorithm,
     ComputeType,
@@ -34,15 +33,10 @@ from gpu._cublas.cublas import (
 )
 from gpu._cublas.cublaslt import (
     Context,
-    MatmulAlgorithm,
     Preference,
-    cublasLtCreate,
-    cublasLtDestroy,
-    cublasLtGetVersion,
     cublasLtLoggerSetLevel,
     cublasLtMatmul,
     cublasLtMatmulAlgoGetHeuristic,
-    cublasLtMatmulAlgoInit,
     cublasLtMatmulDesc_t,
     cublasLtMatmulDescAttributes_t,
     cublasLtMatmulDescCreate,
@@ -58,7 +52,6 @@ from gpu._cublas.cublaslt import (
     cublasLtMatrixLayoutDestroy,
 )
 from gpu._cublas.dtype import DataType
-from gpu._cublas.result import Result
 from gpu._rocblas.hipblaslt import (
     _check_hipblas_error,
     _convert_to_hip_datatype,
@@ -86,9 +79,6 @@ from gpu._rocblas.hipblaslt import (
 from gpu.host import DeviceContext
 from gpu.host._amdgpu_hip import HIP
 from gpu.host._nvidia_cuda import CUDA
-from gpu.host.info import DEFAULT_GPU, H100
-from layout import Layout
-from memory import UnsafePointer
 
 from utils.variant import Variant
 
@@ -97,9 +87,8 @@ from utils.variant import Variant
 # ===----------------------------------------------------------------------===#
 
 
-@value
 @register_passable("trivial")
-struct Backend(Writable):
+struct Backend(Copyable, EqualityComparable, Movable, Writable):
     var _value: Int32
 
     alias AUTOMATIC = Self(0)
@@ -142,13 +131,15 @@ struct Backend(Writable):
         writer.write("HIPBLASLT")
 
 
-fn _resolve_backend[backend: Backend, type: DType = DType.invalid]() -> Backend:
+fn _resolve_backend[
+    backend: Backend, dtype: DType = DType.invalid
+]() -> Backend:
     @parameter
     if backend is not Backend.AUTOMATIC:
         return backend
     elif has_amd_gpu_accelerator():
-        return Backend.ROCBLAS
-    elif type.is_float8() or (DEFAULT_GPU > H100 and type.is_half_float()):
+        return Backend.HIPBLASLT
+    elif dtype.is_float8():
         return Backend.CUBLASLT
     return Backend.CUBLAS
 
@@ -158,16 +149,15 @@ fn _resolve_backend[backend: Backend, type: DType = DType.invalid]() -> Backend:
 # ===----------------------------------------------------------------------===#
 
 
-@value
-struct Handle[backend: Backend = _resolve_backend[Backend.AUTOMATIC]()]:
+struct Handle[backend: Backend = _resolve_backend[Backend.AUTOMATIC]()](
+    Copyable, Movable
+):
     alias resolved_backend = _resolve_backend[backend]()
     alias _cublas_type = UnsafePointer[cublasContext]
-    alias _cublaslt_type = UnsafePointer[Context]
     alias _rocblas_type = _rocblas.Handle
     alias _hipblaslt_type = hipblasLtHandle_t
     alias type = Variant[
         Self._cublas_type,
-        Self._cublaslt_type,
         Self._rocblas_type,
         Self._hipblaslt_type,
     ]
@@ -175,13 +165,9 @@ struct Handle[backend: Backend = _resolve_backend[Backend.AUTOMATIC]()]:
 
     fn __init__(out self) raises:
         @parameter
-        if Self.resolved_backend is Backend.CUBLAS:
+        if Self.resolved_backend in (Backend.CUBLAS, Backend.CUBLASLT):
             var handle = Self._cublas_type()
             check_cublas_error(cublasCreate(UnsafePointer(to=handle)))
-            self._handle = handle
-        elif Self.resolved_backend is Backend.CUBLASLT:
-            var handle = Self._cublaslt_type()
-            check_cublas_error(cublasLtCreate(UnsafePointer(to=handle)))
             self._handle = handle
         elif Self.resolved_backend is Backend.ROCBLAS:
             var handle = Self._rocblas_type()
@@ -207,13 +193,9 @@ struct Handle[backend: Backend = _resolve_backend[Backend.AUTOMATIC]()]:
     @always_inline
     fn __exit__(mut self) raises:
         @parameter
-        if Self.resolved_backend is Backend.CUBLAS:
+        if Self.resolved_backend in (Backend.CUBLAS, Backend.CUBLASLT):
             check_cublas_error(cublasDestroy(self._get_cublas()))
             self._handle = Self._cublas_type()
-            return
-        elif Self.resolved_backend is Backend.CUBLASLT:
-            check_cublas_error(cublasLtDestroy(self._get_cublaslt()))
-            self._handle = Self._cublaslt_type()
             return
         elif Self.resolved_backend is Backend.ROCBLAS:
             _rocblas.check_error(
@@ -230,10 +212,8 @@ struct Handle[backend: Backend = _resolve_backend[Backend.AUTOMATIC]()]:
 
     fn _is_null(self) -> Bool:
         @parameter
-        if Self.resolved_backend is Backend.CUBLAS:
+        if Self.resolved_backend in (Backend.CUBLAS, Backend.CUBLASLT):
             return self._get_cublas() == Self._cublas_type()
-        elif Self.resolved_backend is Backend.CUBLASLT:
-            return self._get_cublaslt() == Self._cublaslt_type()
         elif Self.resolved_backend is Backend.ROCBLAS:
             return self._get_rocblas() == Self._rocblas_type()
         elif Self.resolved_backend is Backend.HIPBLASLT:
@@ -243,16 +223,10 @@ struct Handle[backend: Backend = _resolve_backend[Backend.AUTOMATIC]()]:
 
     fn _get_cublas(self) -> Self._cublas_type:
         constrained[
-            Self.resolved_backend is Backend.CUBLAS, "backend must be CUBLAS"
+            Self.resolved_backend in (Backend.CUBLAS, Backend.CUBLASLT),
+            "backend must be CUBLAS/CUBLASLT",
         ]()
         return self._handle[Self._cublas_type]
-
-    fn _get_cublaslt(self) -> Self._cublas_type:
-        constrained[
-            Self.resolved_backend is Backend.CUBLASLT,
-            "backend must be CUBLASLT",
-        ]()
-        return self._handle[Self._cublaslt_type]
 
     fn _get_rocblas(self) -> Self._rocblas_type:
         constrained[
@@ -283,21 +257,21 @@ alias _DEBUG_VENDOR_BLAS = False
 
 fn _attach_handle_to_stream(ctx: DeviceContext, handle: Handle) raises:
     @parameter
-    if handle.resolved_backend is Backend.CUBLAS:
+    if handle.resolved_backend in (Backend.CUBLAS, Backend.CUBLASLT):
         check_cublas_error(
             cublasSetStream(handle._get_cublas(), CUDA(ctx.stream()))
         )
 
         @parameter
         if _DEBUG_VENDOR_BLAS:
-            check_cublas_error(
-                cublasLoggerConfigure(1, 1, 0, UnsafePointer[Int8]())
-            )
-    elif handle.resolved_backend is Backend.CUBLASLT:
 
-        @parameter
-        if _DEBUG_VENDOR_BLAS:
-            check_cublas_error(cublasLtLoggerSetLevel(5))
+            @parameter
+            if handle.resolved_backend is Backend.CUBLAS:
+                check_cublas_error(
+                    cublasLoggerConfigure(1, 1, 0, UnsafePointer[Int8]())
+                )
+            else:
+                check_cublas_error(cublasLtLoggerSetLevel(5))
 
     elif handle.resolved_backend is Backend.ROCBLAS:
         _rocblas.check_error(
@@ -308,10 +282,11 @@ fn _attach_handle_to_stream(ctx: DeviceContext, handle: Handle) raises:
 
 
 fn _get_global_handle[
-    backend: Backend = _resolve_backend[Backend.AUTOMATIC]()
+    dtype: DType,
+    backend: Backend = _resolve_backend[Backend.AUTOMATIC, dtype=dtype](),
 ](ctx: DeviceContext) raises -> Handle[backend]:
-    alias HANDLE_NAME = String("LINALG_VENDOR_BLAS_", backend)
-    if global_ptr := _get_global_or_null[HANDLE_NAME]().bitcast[
+    var HANDLE_NAME = String("LINALG_VENDOR_BLAS_", backend, "_", ctx.id())
+    if global_ptr := _get_global_or_null(HANDLE_NAME).bitcast[
         Handle[backend]
     ]():
         _attach_handle_to_stream(ctx, global_ptr[])
@@ -348,18 +323,21 @@ fn matmul[
     Matmul using the vendor BLAS library. With a global handle.
     """
 
-    return matmul[use_tf32](
-        ctx,
-        _get_global_handle(ctx),
-        c,
-        a,
-        b,
-        c_row_major=c_row_major,
-        transpose_a=transpose_a,
-        transpose_b=transpose_b,
-        alpha=alpha,
-        beta=beta,
-    )
+    # Push the device context to ensure correct CUDA context is current for all
+    # vendor BLAS calls.
+    with ctx.push_context() as cur_ctx:
+        return matmul[use_tf32](
+            cur_ctx,
+            _get_global_handle[a.type](ctx),
+            c,
+            a,
+            b,
+            c_row_major=c_row_major,
+            transpose_a=transpose_a,
+            transpose_b=transpose_b,
+            alpha=alpha,
+            beta=beta,
+        )
 
 
 fn matmul[
@@ -407,7 +385,7 @@ fn matmul[
     elif handle.resolved_backend is Backend.CUBLASLT:
         _cublasLt_matmul(
             ctx,
-            handle._get_cublaslt(),
+            handle._get_cublas().bitcast[Context](),
             c,
             a,
             b,
@@ -923,7 +901,7 @@ fn _cublasLt_matmul(
                 a.data.bitcast[NoneType](),  # _b
                 _bdesc,  # _bdesc
                 UnsafePointer(to=beta).bitcast[NoneType](),  # beta
-                UnsafePointer[NoneType](),  # _c
+                OpaquePointer(),  # _c
                 _cdesc,  # _cdesc
                 d.data.bitcast[NoneType](),  # _d
                 _ddesc,  # _ddesc
@@ -945,7 +923,7 @@ fn _cublasLt_matmul(
                 b.data.bitcast[NoneType](),  # _b
                 _bdesc,  # _bdesc
                 UnsafePointer(to=beta).bitcast[NoneType](),  # beta
-                UnsafePointer[NoneType](),  # _c
+                OpaquePointer(),  # _c
                 _cdesc,  # _cdesc
                 d.data.bitcast[NoneType](),  # _d
                 _ddesc,  # _ddesc
@@ -1119,7 +1097,7 @@ fn _hipblasLt_matmul(
             _ddata,
             _ddesc,
             UnsafePointer(to=heuristicResult.algo),
-            UnsafePointer[NoneType](),
+            OpaquePointer(),
             0,
             HIP(ctx.stream()),
         )

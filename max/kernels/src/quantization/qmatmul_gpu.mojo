@@ -11,13 +11,9 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from collections import Optional, OptionalReg
-from collections.string import StaticString
-from math import ceildiv, isclose
-from pathlib import Path
-from random import rand, randint, random_float64, seed
-from sys import alignof, argv, is_nvidia_gpu, simdwidthof, sizeof
-from sys._assembly import inlined_assembly
+from sys import alignof, is_nvidia_gpu, simdwidthof, sizeof
+from collections import OptionalReg
+from math import ceildiv
 
 from bit import log2_floor
 from buffer import NDBuffer
@@ -31,16 +27,14 @@ from gpu import (
     lane_id,
     thread_idx,
 )
-from gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
-from gpu.host.info import A100, DEFAULT_GPU_ARCH, is_gpu
-from gpu.intrinsics import lop
+from gpu.host import DeviceContext, FuncAttribute
+from gpu.host.info import is_gpu
 from gpu.memory import (
     AddressSpace,
     async_copy_commit_group,
     async_copy_wait_group,
     external_memory,
 )
-from gpu.mma import ld_matrix, mma
 from layout import RuntimeLayout
 from layout._ndbuffer_stub import from_ndbuffer_row_major
 from layout.int_tuple import IntTuple
@@ -48,32 +42,25 @@ from layout.layout import *
 from layout.layout_tensor import (
     LayoutTensor,
     LayoutTensorIter,
-    _swizzle_signature,
-    copy,
+    copy_local_to_shared,
     copy_dram_to_sram,
     copy_dram_to_sram_async,
     copy_local_to_dram,
-    copy_local_to_local,
     copy_sram_to_dram,
 )
-from layout.runtime_tuple import RuntimeTuple
 from layout.swizzle import Swizzle, make_ldmatrix_swizzle, make_swizzle
 from layout.tensor_builder import LayoutTensorBuild as tb
 from layout.tensor_core import TensorCore, get_fragment_size, get_mma_shape
 from linalg._multistage_gemm_gpu import warp_split_k_reduction
-from linalg.matmul_gpu import _matmul_gpu
 from linalg.utils import GemmShape, apply_epilogue, elementwise_epilogue_type
 from linalg.utils_gpu import (
     MatmulConfig,
-    MatmulKernels,
     block_swizzle,
-    select_config,
 )
-from memory import UnsafePointer
 from memory.unsafe import bitcast
 from runtime.asyncrt import DeviceContextPtr
 
-from utils.index import Index, IndexList
+from utils.index import Index
 from utils.numerics import get_accum_type
 
 
@@ -358,7 +345,7 @@ fn multistage_mma_q[
                     b_wtile_coord0, b_wtile_coord1
                 )
 
-                # prefecth scales into regs every (group_size) rows
+                # prefetch scales into regs every (group_size) rows
                 if (k_tile_id + 1) % (group_size // BK) == 0:
                     scales_smem_iter._incr()
                     scales_warp_tile = scales_smem_iter[].tile[
@@ -544,7 +531,7 @@ fn multistage_qgemm_kernel[
     ) if swizzle_block else Index(Int(block_idx.x), Int(block_idx.y))
 
     # Coordinates of the current warp.
-    warp_y, warp_x = divmod(warp_id, num_warps_n)
+    var warp_y, warp_x = divmod(warp_id, num_warps_n)
 
     # Prepare circular shared memory buffer for A and B.
     # Each pipeline stage has its own buffer.
@@ -716,7 +703,7 @@ fn multistage_qgemm_kernel[
         for i in range(__type_of(c_gmem_frag).layout.size()):
             alias src_idx = c_reg_frag.layout(i)
             alias dst_static_idx: UInt = __type_of(c_gmem_frag).layout(i)
-            var dst_idx = 0
+            var dst_idx: Int
 
             @parameter
             if c_gmem_frag.layout.all_dims_known():
@@ -762,7 +749,10 @@ fn multistage_qgemm_kernel[
             .view(a_smem.bitcast[Scalar[c_type]]() + Int(warp_id * WM * WN))
         )
 
-        copy[thread_layout = Layout.row_major(8, 4), swizzle=swizzle,](
+        copy_local_to_shared[
+            thread_layout = Layout.row_major(8, 4),
+            swizzle=swizzle,
+        ](
             accum_smem_warp_tile.vectorize[1, 2](),
             c_reg_tile.vectorize[1, 2]().transpose(),
         )
@@ -802,7 +792,7 @@ fn multistage_qgemm_kernel[
                 )
 
                 alias dst_static_idx = __type_of(c_gmem_frag).layout(i)
-                var dst_idx = 0
+                var dst_idx: Int
 
                 @parameter
                 if c_gmem_frag.layout.all_dims_known():
@@ -1071,7 +1061,7 @@ fn repack_Q4_0_for_sm8x[
             alias thd_layout = Layout.row_major(8, 4)
             # The first 2 Bytes is the scale for this Q4_0 block
             # GGUF pack elements 0-15 in the lower 4-bit of the 16 Bytes,
-            # and elments 16-31 in the higher 4-bit of the 16 Bytes.
+            # and elements 16-31 in the higher 4-bit of the 16 Bytes.
             #
             # This gets elements 0, 1, 8, 9, 16, 17, 24, 25 for
             # thread 0.

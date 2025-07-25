@@ -29,9 +29,7 @@ coordinate transformations (`idx2crd`, `crd2idx`), and specialized tensor operat
 like shape division and prefix products.
 """
 
-from collections import InlineArray
 from os import abort
-from sys import bitwidthof
 
 from builtin.dtype import _int_type_of_width, _uint_type_of_width
 from layout.int_tuple import UNKNOWN_VALUE, IntTuple, flatten
@@ -42,7 +40,7 @@ from layout.int_tuple import shape_div as shape_div_int_tuple
 from utils import IndexList
 
 
-fn concat(owned lhs: IntTuple, rhs: IntTuple) -> IntTuple:
+fn concat(var lhs: IntTuple, rhs: IntTuple) -> IntTuple:
     """Concatenates two `IntTuple` instances into a single `IntTuple`.
 
     This function appends all elements from the right-hand side tuple to the
@@ -50,7 +48,7 @@ fn concat(owned lhs: IntTuple, rhs: IntTuple) -> IntTuple:
     the hierarchical structure of both tuples.
 
     Args:
-        lhs: The left-hand side `IntTuple` that will be modified (owned parameter).
+        lhs: The left-hand side `IntTuple` that will be modified (var parameter).
         rhs: The right-hand side `IntTuple` whose elements will be appended.
 
     Returns:
@@ -72,7 +70,7 @@ fn _get_returned_type[bitwidth: Int, unsigned: Bool]() -> DType:
 @register_passable("trivial")
 struct RuntimeTuple[
     S: IntTuple = UNKNOWN_VALUE, /, *, element_type: DType = DType.int64
-](Intable, Stringable, Sized, Writable):
+](Defaultable, Intable, Sized, Stringable, Writable):
     """A struct representing tuple-like data with compile-time and runtime elements.
     RuntimeTuple combines static (compile-time) and dynamic (runtime) handling of
     tuple-like data structures, typically used for tensor shapes, indices, and coordinates
@@ -100,7 +98,7 @@ struct RuntimeTuple[
         For dimensions with known compile-time values in S, uses those values.
         For unknown dimensions, initializes them to UNKNOWN_VALUE.
         """
-        self.value = __type_of(self.value)()
+        self.value = {}
 
         alias f = flatten(S)
 
@@ -342,19 +340,21 @@ struct RuntimeTuple[
         return l
 
     @always_inline
-    fn cast[type: DType](self, out result: RuntimeTuple[S, element_type=type]):
+    fn cast[
+        dtype: DType
+    ](self, out result: RuntimeTuple[S, element_type=dtype]):
         """Casts the RuntimeTuple to use a different numeric type.
         This method creates a new RuntimeTuple with the same structure and values
         but using a different underlying numeric type for storage. This is useful
         for changing precision or signedness of the data.
 
         Parameters:
-            type: The target DType to cast the elements to.
+            dtype: The target DType to cast the elements to.
 
         Returns:
             A new `RuntimeTuple` with elements cast to the specified type.
         """
-        return __type_of(result)(self.value.cast[type]())
+        return __type_of(result)(self.value.cast[dtype]())
 
     @always_inline
     fn __int__(self) -> Int:
@@ -569,7 +569,14 @@ fn crd2idx[
         constrained[
             shape_t.is_tuple()
             and (len(crd_t) == len(shape_t) == len(stride_t)),
-            "Inputs should have same rank",
+            String(
+                "Inputs should have same rank but got crd_t: ",
+                len(crd_t),
+                " shape_t: ",
+                len(shape_t),
+                " stride_t: ",
+                len(stride_t),
+            ),
         ]()
         var r: Scalar[out_type] = 0
         alias size = min(min(len(crd_t), len(shape_t)), len(stride_t))
@@ -593,7 +600,7 @@ fn crd2idx[
 
             @parameter
             for i in range(last_elem_idx):
-                divisor, quotient = divmod(Int(int_crd), product(shape[i]))
+                var divisor, quotient = divmod(Int(int_crd), product(shape[i]))
                 result += crd2idx[crd_t, out_type=out_type](
                     quotient, shape[i], stride[i]
                 )

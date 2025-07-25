@@ -36,9 +36,7 @@ This implementation is specifically optimized for NVIDIA GPUs with Tensor Core s
 """
 from sys import sizeof
 
-from gpu import WARP_SIZE, barrier
 from gpu.host._nvidia_cuda import TensorMapSwizzle
-from gpu.id import thread_idx
 from gpu.memory import AddressSpace
 from gpu.mma import (
     WGMMADescriptor,
@@ -50,7 +48,6 @@ from gpu.mma import (
 from layout import IntTuple, Layout, LayoutTensor
 from layout.layout import (
     MakeLayoutList,
-    coalesce,
     composition,
     downcast,
     logical_divide,
@@ -60,9 +57,8 @@ from layout.layout import (
     tile_to_shape,
     upcast,
 )
-from memory.unsafe_pointer import UnsafePointer
 
-from utils import Index, IndexList, StaticTuple
+from utils import IndexList, StaticTuple
 
 # ===-----------------------------------------------------------------------===#
 # WGMMA shared memory layout                                                   #
@@ -177,7 +173,9 @@ fn _supported_mma_shape[
     # (https://mlir.llvm.org/docs/Dialects/NVVMDialect/#nvvmwgmmamma_async-nvvmwgmmammaasyncop).
     @parameter
     if mma_shape[0] == 64 and mma_shape[2] == 8:
-        return mma_shape[1] in (8,)
+        return (
+            mma_shape[1] % 8 == 0 and mma_shape[1] >= 8 and mma_shape[1] <= 256
+        )
     elif mma_shape[0] == 64 and mma_shape[2] == 16:
         return (
             mma_shape[1] % 8 == 0 and mma_shape[1] >= 8 and mma_shape[1] <= 256
@@ -191,8 +189,10 @@ fn _supported_mma_shape[
 
 
 # Core matrix dimensions
-# Each core matix has 8 rows and 16 bytes per row.
+# Each core matrix has 8 rows and 16 bytes per row.
 alias _CM_NUM_ROWS = 8
+
+
 alias _CM_ROW_BYTES = 16
 alias _CM_ROW_BITS = 128
 
@@ -242,7 +242,7 @@ fn _checked_tile_shape[
     if swizzle_mode != TensorMapSwizzle.SWIZZLE_NONE:
         alias k_bytes = BK * sizeof[type]()
         constrained[
-            k_bytes == swizzle_mode.bytes(),
+            (k_bytes % swizzle_mode.bytes()) == 0,
             "K dim "
             + String(k_bytes)
             + " doesn't match "
@@ -541,7 +541,7 @@ fn _wgmma_descriptor[
             + String(layout),
         ]()
 
-        # Ingore 4 LSB.
+        # Ignore 4 LSB.
         alias SBO = (stride01 * sizeof[type]()) >> 4
         alias LBO = (stride11 * sizeof[type]()) >> 4
 
@@ -631,7 +631,7 @@ fn _convert_cfrags_to_tuple[
 
     @parameter
     for i in range(c_frag_size):
-        c_frags_in_tuple[i] = rebind[Scalar[c_type]](c_frags._get[0, i]())
+        c_frags_in_tuple[i] = rebind[Scalar[c_type]](c_frags[0, i])
 
     return c_frags_in_tuple
 
@@ -647,7 +647,7 @@ fn _convert_cfrags_to_simd[
 ):
     @parameter
     for i in range(c_frag_size):
-        c_frags._set[0, i](c_frags_in_tuple[i])
+        c_frags[0, i] = c_frags_in_tuple[i]
 
 
 struct TensorCoreAsync[
@@ -659,7 +659,7 @@ struct TensorCoreAsync[
     a_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_NONE,
     b_swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_NONE,
     transpose_b: Bool = False,
-]:
+](Defaultable):
     """High-performance asynchronous tensor core operations for matrix multiplication.
 
     This struct provides methods for utilizing NVIDIA's Tensor Cores for asynchronous
@@ -800,7 +800,7 @@ struct TensorCoreAsync[
         if num_warp_groups > 1:
             a_desc += a_m_stride * num_m_mmas * wg_idx
 
-        alias layout_b = "col" if transpose_b else StaticString("row")
+        alias layout_b = "col" if transpose_b else "row"
         alias c_frag_size = mma_shape[0] * mma_shape[1] // 128
 
         @parameter
@@ -942,7 +942,7 @@ struct TensorCoreAsync[
         b_desc = _wgmma_descriptor[b_canonical_layout, transpose_b, b_swizzle](
             b_smem_tile.ptr
         )
-        alias layout_b = "col" if transpose_b else StaticString("row")
+        alias layout_b = "col" if transpose_b else "row"
 
         @parameter
         for k_mma in range(num_k_mmas):

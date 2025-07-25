@@ -27,7 +27,7 @@ from max.graph import (
 from PIL import Image
 
 
-def main():
+def main() -> None:
     device = CPU() if accelerator_count() == 0 else Accelerator()
     img = np.array(Image.open(Path(__file__).parent / "dogs.jpg"))
 
@@ -52,6 +52,7 @@ def main():
     def grayscale(x: TensorValue) -> TensorValue:
         return ops.custom(
             name="grayscale",
+            device=DeviceRef.from_device(device),
             values=[x],
             out_types=[gray_tensor_type],
         )[0].tensor
@@ -59,6 +60,7 @@ def main():
     def brightness(x: TensorValue, brightness: float) -> TensorValue:
         return ops.custom(
             name="brightness",
+            device=DeviceRef.from_device(device),
             values=[
                 x,
                 ops.constant(brightness, DType.float32, DeviceRef.CPU()),
@@ -69,6 +71,7 @@ def main():
     def blur(x: TensorValue, blur_size: int) -> TensorValue:
         return ops.custom(
             name="blur",
+            device=DeviceRef.from_device(device),
             values=[
                 x,
                 ops.constant(blur_size, DType.int64, DeviceRef.CPU()),

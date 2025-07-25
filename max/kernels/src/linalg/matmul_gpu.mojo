@@ -10,18 +10,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-from collections import InlineArray, OptionalReg
-from math import align_down, align_up, ceildiv
-from pathlib import Path
+from collections import OptionalReg
+from math import align_down, ceildiv
 from sys import (
     alignof,
-    bitwidthof,
     env_get_bool,
     env_get_int,
     has_accelerator,
     has_amd_gpu_accelerator,
-    has_nvidia_gpu_accelerator,
-    is_defined,
     llvm_intrinsic,
     simdwidthof,
 )
@@ -30,59 +26,38 @@ from algorithm.functional import elementwise, tile_and_unswitch
 from buffer.buffer import NDBuffer
 from buffer.dimlist import DimList
 from gpu import (
-    WARP_SIZE,
     barrier,
     block_dim,
-    block_idx,
     global_idx,
-    lane_id,
     thread_idx,
 )
 from gpu.grid_controls import PDLLevel
-from gpu.host import DeviceContext, FuncAttribute, LaunchAttribute
-from gpu.host._compile import _get_gpu_target
-from gpu.host.info import A100, B200, B100, DEFAULT_GPU, H100
-from gpu.memory import AddressSpace, CacheOperation, load
-from gpu.mma import ld_matrix, mma
+from gpu.host import DeviceContext, FuncAttribute
+from gpu.host import get_gpu_target
+from gpu.host.info import A100, H100
+from gpu.memory import AddressSpace
 from layout._ndbuffer_stub import (
-    copy_from_nd_buffer,
-    distribute,
     from_ndbuffer_row_major,
-    vectorize,
 )
-from layout.int_tuple import IntTuple
 from layout.layout import *
-from layout.layout_tensor import (
-    LayoutTensor,
-    _swizzle_signature,
-    copy_dram_to_sram_async,
-    copy_local_to_dram,
-    copy_sram_to_local,
-)
-from layout.math import outer_product_acc
-from linalg.matmul_tile_scheduler import MatmulSchedule
-from memory import UnsafePointer, bitcast, memset_zero, stack_allocation
+from logger import Logger
+from memory import bitcast, stack_allocation
 
 from utils import IndexList
 from utils.index import Index
 from utils.numerics import get_accum_type
-from utils.static_tuple import StaticTuple
 
-from ._amd_gemm_gpu import gemm_kernel as amd_gemm_kernel
+from .matmul_amd import gemm_kernel_amd
 from ._multistage_gemm_gpu import (
     multistage_gemm_kernel,
     multistage_gemm_split_k_kernel,
 )
 from .dispatch_table_a100_gpu import create_matmul_configs_ampere
 from .gemv import gemv_gpu
-from .matmul_sm90 import (
-    hopper_matmul_tma_wgmma,
-    warp_specialize_gemm_with_multicasting,
-)
 from .matmul_vendor import matmul as matmul_vendor
+from .matmul_dispatch_sm90 import matmul_dispatch_sm90
 from .utils import (
     GemmShape,
-    apply_epilogue,
     elementwise_compute_lambda_type,
     elementwise_epilogue_type,
 )
@@ -90,49 +65,34 @@ from .utils_gpu import (
     MatmulConfig,
     MatmulKernels,
     _bk_base,
-    _get_block_warp_tile_shape,
     select_config,
 )
 
 
-fn _find_largest_bn_for_sm90_matmul[N: Int]() -> Int:
-    @parameter
-    if N % 8 != 0:
-        return -1
-
-    fn _get_max_bn() capturing -> Int:
-        var BN = 256
-        while BN >= 8:
-            if N % BN == 0:
-                return BN
-            BN -= 8
-        return 8
-
-    return _get_max_bn()
-
-
 @always_inline
-fn __nvvm_ldg_f4[type: DType](x: UnsafePointer[Scalar[type]]) -> SIMD[type, 4]:
+fn __nvvm_ldg_f4[
+    dtype: DType
+](x: UnsafePointer[Scalar[dtype]]) -> SIMD[dtype, 4]:
     # Load a register variable from global state space via non-coherent cache.
 
-    alias alignment = Int32(alignof[SIMD[type, 4]]())
+    alias alignment = Int32(alignof[SIMD[dtype, 4]]())
 
     @parameter
-    if type is DType.float32:
-        return bitcast[type, 4](
+    if dtype is DType.float32:
+        return bitcast[dtype, 4](
             llvm_intrinsic[
                 "llvm.nvvm.ldg.global.f.v4f32.p0v4f32", SIMD[DType.float32, 4]
             ](x.bitcast[Float32](), alignment)
         )
-    elif type is DType.bfloat16:
-        return bitcast[type, 4](
+    elif dtype is DType.bfloat16:
+        return bitcast[dtype, 4](
             llvm_intrinsic[
                 "llvm.nvvm.ldg.global.f.v4bf16.p0v4bf16",
                 SIMD[DType.bfloat16, 4],
             ](x.bitcast[BFloat16](), alignment)
         )
-    elif type is DType.float16:
-        return bitcast[type, 4](
+    elif dtype is DType.float16:
+        return bitcast[dtype, 4](
             llvm_intrinsic[
                 "llvm.nvvm.ldg.global.f.v4f16.p0v4f16",
                 SIMD[DType.float16, 4],
@@ -303,9 +263,9 @@ fn matmul_kernel_naive[
         c[Index(x, y)] = accum.cast[c_type]()
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct AMDSchedulerTuning:
+struct AMDSchedulerTuning(Copyable, Movable):
     var block_shape: IndexList[2]
     var tuning_values: IndexList[3]
 
@@ -338,7 +298,20 @@ fn _matmul_sm100[
     var n = shape.N
     var k = shape.K
 
+    var logger = Logger()
+    logger.info("------ Dispatching to SM100 (B200+) ------")
+
     try:
+        # On B200 our gemv matmul is faster than cublas for skinny bfloat16 matmuls
+        @parameter
+        if a_type is DType.bfloat16:
+            if n == 1 or m == 1:
+                return gemv_gpu[
+                    transpose_b=transpose_b,
+                    elementwise_lambda_fn=elementwise_lambda_fn,
+                ](c, a, b, ctx)
+
+        logger.info("Executing vendor BLAS (cuBLAS)")
         return matmul_vendor[
             use_tensor_core=use_tensor_core,
             transpose_b=transpose_b,
@@ -346,10 +319,13 @@ fn _matmul_sm100[
             config=config,
             _trace_description=_trace_description,
         ](c, a, b, ctx)
+
     except:
         # fallback to multistage/naive gemms if the cublas failed. This is a workaround for now for KERN-1812
+        logger.warning("Vendor BLAS failed")
+
         @parameter
-        if K * sizeof[a_type]() >= 8 * 16:
+        if not a_type.is_float8() and K * sizeof[a_type]() >= 8 * 16:
             alias kernels = MatmulKernels[a_type, b_type, c_type, transpose_b]()
             alias config = kernels.ampere_256x64_4
             multistage_gemm[
@@ -365,6 +341,9 @@ fn _matmul_sm100[
             )
         else:
             alias BLOCK_DIM = 16
+            logger.info(
+                "Executing: Naive MATMUL kernel (BLOCK_DIM=", BLOCK_DIM, ")"
+            )
             ctx.enqueue_function[
                 matmul_kernel_naive[
                     c_type,
@@ -417,6 +396,15 @@ fn _matmul_gpu[
     var n = shape.N
     var k = shape.K
 
+    var logger = Logger()
+    logger.info("---- MATMUL GPU execution started ----")
+    logger.info("MxNxK: ", m, "x", n, "x", k)
+    logger.info("Data types: A=", a_type, " B=", b_type, " C=", c_type)
+    logger.info("Device: ", ctx.name())
+    logger.info(
+        "Transpose B: ", transpose_b, " Use Tensor Core: ", use_tensor_core
+    )
+
     alias s_type = DType.float32 if (
         a_type is DType.bfloat16 or a_type is DType.float16
     ) else c_type
@@ -440,8 +428,8 @@ fn _matmul_gpu[
     @parameter
     @always_inline
     fn compute_lambda_wrapper[
-        _type: DType, _width: Int, *, alignment: Int = 1
-    ](coords: IndexList[2], val: SIMD[_type, _width]):
+        _dtype: DType, _width: Int, *, alignment: Int = 1
+    ](coords: IndexList[2], val: SIMD[_dtype, _width]):
         @parameter
         if elementwise_compute_lambda_fn:
             alias compute_lambda = elementwise_compute_lambda_fn.value()
@@ -471,10 +459,23 @@ fn _matmul_gpu[
     alias has_static_NK = b_shape.all_known[2]() \
                       and a_shape.has_value[1]() \
                       and c_shape.has_value[1]()
+
+    logger.info("Static shapes available: N=", b_shape.has_value[1](), " K=", a_shape.has_value[1]())
     # fmt: on
 
     @parameter
-    if DEFAULT_GPU > H100:
+    if env_get_bool["MODULE_USE_VENDOR_BLAS", False]():
+        logger.info("Executing: Vendor BLAS")
+        return matmul_vendor[
+            use_tensor_core=use_tensor_core,
+            transpose_b=transpose_b,
+            elementwise_lambda_fn=elementwise_lambda_wrapper,
+            config=config,
+            _trace_description=_trace_description,
+        ](c, a, b, ctx)
+
+    @parameter
+    if ctx.device_info > H100:
         return _matmul_sm100[
             c_type,
             a_type,
@@ -487,211 +488,24 @@ fn _matmul_gpu[
             pdl_level=pdl_level,
         ](c, a, b, ctx)
 
+    alias use_A100_kernels_on_H100 = env_get_int[
+        "USE_EXPERIMENTAL_KERNELS", 0
+    ]()
+
     @parameter
-    if env_get_bool["MODULE_USE_VENDOR_BLAS", False]():
-        return matmul_vendor[
-            use_tensor_core=use_tensor_core,
-            transpose_b=transpose_b,
+    if ctx.device_info is H100 and not use_A100_kernels_on_H100:
+        var status = matmul_dispatch_sm90[
+            c_type,
+            a_type,
+            b_type,
+            transpose_b,
             elementwise_lambda_fn=elementwise_lambda_wrapper,
-            config=config,
-            _trace_description=_trace_description,
+            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
+            pdl_level=pdl_level,
         ](c, a, b, ctx)
 
-    @parameter
-    if (
-        (a_type is DType.float8_e4m3fn)
-        and a_type == b_type
-        and ctx.device_info is H100
-        and transpose_b
-        and has_static_NK
-    ):
-
-        @parameter
-        if env_get_bool["AUTOTUNING_MODE", False]():
-            if env_get_bool["H100_SPECIFIC", False]():
-                alias NUM_PIPELINE_STAGES = env_get_int[
-                    "TUNE_NUM_PIPELINE_STAGES", 6
-                ]()
-                alias NUM_CONSUMER = env_get_int["TUNE_NUM_CONSUMER", 2]()
-                alias WGMMA_N = env_get_int["TUNE_WGMMA_N", 128]()
-                alias CLUSTER_DIM_X = env_get_int["TUNE_CLUSTER_DIM_X", 1]()
-                alias GRID_DIM_X = env_get_int["TUNE_GRID_DIM_X", 1]()
-                alias GRID_DIM_Y = H100.sm_count // GRID_DIM_X
-                alias BLOCK_TILE_DIM_M = 64 * NUM_CONSUMER
-
-                alias SCHEDULE_TYPE = MatmulSchedule(
-                    env_get_int["TUNE_SCHEDULE_TYPE", 1]()
-                )
-
-                alias H100_FP8_TUNING_CONFIG = MatmulConfig[
-                    a_type,
-                    b_type,
-                    c_type,
-                    transpose_b,
-                    mma_shape = Index(64, WGMMA_N, 32),
-                ](
-                    block_tile_shape=Index(BLOCK_TILE_DIM_M, WGMMA_N, 128),
-                    cluster_shape=Index(CLUSTER_DIM_X, 1, 1),
-                    num_pipeline_stages=NUM_PIPELINE_STAGES,
-                    num_consumer=NUM_CONSUMER,
-                    partitioned_multicast=False,
-                    pdl_level=pdl_level,
-                )
-                warp_specialize_gemm_with_multicasting[
-                    transpose_b=transpose_b,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                    elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                    config=H100_FP8_TUNING_CONFIG,
-                    grid_shape = Index(GRID_DIM_X, GRID_DIM_Y),
-                    schedule=SCHEDULE_TYPE,
-                ](
-                    rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                    rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                    rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                    m,
-                    n,
-                    k,
-                    ctx,
-                )
-                return
-
-        alias static_N = c_shape.get[1]()
-        alias static_K = a_shape.get[1]()
-
-        # llama-8B-FP8 gemm shapes
-        @parameter
-        if (
-            (static_N == 6144 and static_K == 4096)
-            or (static_N == 4096 and static_K == 4096)
-            or (static_N == 28672 and static_K == 4096)
-            or (static_N == 4096 and static_K == 14336)
-        ):
-            if m <= 128:
-                alias config = MatmulConfig[
-                    a_type,
-                    b_type,
-                    c_type,
-                    transpose_b,
-                    mma_shape = Index(64, 128, 32),
-                ](
-                    block_tile_shape=Index(64, 128, 128),
-                    cluster_shape=Index(1, 1, 1),
-                    num_pipeline_stages=8,
-                    num_consumer=1,
-                    partitioned_multicast=True,
-                    pdl_level=pdl_level,
-                )
-                warp_specialize_gemm_with_multicasting[
-                    transpose_b=transpose_b,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                    elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                    config=config,
-                ](
-                    rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                    rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                    rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                    m,
-                    n,
-                    k,
-                    ctx,
-                )
-                return
-            elif m <= 1024:
-                alias config = MatmulConfig[
-                    a_type,
-                    b_type,
-                    c_type,
-                    transpose_b,
-                    mma_shape = Index(64, 128, 32),
-                ](
-                    block_tile_shape=Index(128, 128, 128),
-                    cluster_shape=Index(1, 1, 1),
-                    num_pipeline_stages=6,
-                    num_consumer=2,
-                    partitioned_multicast=True,
-                    pdl_level=pdl_level,
-                )
-                warp_specialize_gemm_with_multicasting[
-                    transpose_b=transpose_b,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                    elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                    config=config,
-                ](
-                    rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                    rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                    rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                    m,
-                    n,
-                    k,
-                    ctx,
-                )
-                return
-            else:
-                alias config = MatmulConfig[
-                    a_type,
-                    b_type,
-                    c_type,
-                    transpose_b,
-                    mma_shape = Index(64, 128, 32),
-                ](
-                    block_tile_shape=Index(128, 128, 128),
-                    cluster_shape=Index(2, 1, 1),
-                    num_pipeline_stages=6,
-                    num_consumer=2,
-                    partitioned_multicast=True,
-                    pdl_level=pdl_level,
-                )
-                warp_specialize_gemm_with_multicasting[
-                    transpose_b=transpose_b,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                    elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                    config=config,
-                    grid_shape = Index(8, H100.sm_count // 8),
-                    schedule = MatmulSchedule.TILE2D,
-                ](
-                    rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                    rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                    rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                    m,
-                    n,
-                    k,
-                    ctx,
-                )
-                return
-        else:
-            # for gemms with small n and k we fall back the naive kernel
-            @parameter
-            if static_N % 128 == 0 and static_K >= 128 and static_K % 32 == 0:
-                alias config = MatmulConfig[
-                    a_type,
-                    b_type,
-                    c_type,
-                    transpose_b,
-                    mma_shape = Index(64, 128, 32),
-                ](
-                    block_tile_shape=Index(128, 128, 128),
-                    cluster_shape=Index(2, 1, 1),
-                    num_pipeline_stages=6,
-                    num_consumer=2,
-                    partitioned_multicast=False,
-                    pdl_level=pdl_level,
-                )
-                warp_specialize_gemm_with_multicasting[
-                    transpose_b=transpose_b,
-                    elementwise_lambda_fn=elementwise_lambda_fn,
-                    elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                    config=config,
-                    schedule = MatmulSchedule.TILE2D,
-                ](
-                    rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                    rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                    rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                    m,
-                    n,
-                    k,
-                    ctx,
-                )
-                return
+        if status:
+            return
 
     @parameter
     if (
@@ -702,6 +516,22 @@ fn _matmul_gpu[
     ):
         if multi_gemm_cond:
             alias kernels = MatmulKernels[a_type, b_type, c_type, transpose_b]()
+
+            # Allow caller to overwrite dispatch heuristic with their own config.
+            @parameter
+            if config:
+                multistage_gemm[
+                    transpose_b=transpose_b,
+                    config = config.value(),
+                    elementwise_lambda_fn=elementwise_lambda_wrapper,
+                ](
+                    rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
+                    rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
+                    rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
+                    config.value(),
+                    ctx,
+                )
+                return
 
             @parameter
             if has_amd_gpu_accelerator():
@@ -878,18 +708,16 @@ fn _matmul_gpu[
                     elif m >= 256:
                         return kernel_helper[128, 192, num_k_partitions=4]()
                 elif static_N == 65536 and static_K == 5120:
-                    if m >= 8192:
+                    if m > 384:
                         return kernel_helper[256, 256]()
-                    elif m >= 7000:
+                    elif m > 256:
+                        return kernel_helper[192, 256]()
+                    elif m > 192:
                         return kernel_helper[256, 256]()
-                    elif m >= 3500:
-                        return kernel_helper[256, 256]()
-                    elif m >= 512:
-                        return kernel_helper[256, 224]()
-                    elif m >= 500:
-                        return kernel_helper[256, 256]()
-                    elif m >= 256:
-                        return kernel_helper[128, 128]()
+                    elif m > 128:
+                        return kernel_helper[192, 256]()
+                    elif m > 64:
+                        return kernel_helper[128, 256]()
                 elif static_N == 5120 and static_K == 32768:
                     if m >= 8192:
                         return kernel_helper[192, 256]()
@@ -1045,480 +873,7 @@ fn _matmul_gpu[
                         return kernel_helper[32, 64, num_k_partitions=4]()
                 return kernel_helper[128, 128]()
 
-            @parameter
-            if env_get_bool["AUTOTUNING_MODE", False]():
-                if env_get_bool["H100_SPECIFIC", False]():
-                    # CLUSTER_DIM_X = 2^m for m in range[0-3]
-                    alias CLUSTER_DIM_X = env_get_int["TUNE_CLUSTER_DIM_X", 1]()
-
-                    # GRID_DIM_X = 2^n for n in range[0-7]
-                    alias GRID_DIM_X = env_get_int["TUNE_GRID_DIM_X", 1]()
-                    alias GRID_DIM_Y = H100.sm_count // GRID_DIM_X
-
-                    alias H100_TUNING_CONFIG = MatmulConfig[
-                        a_type,
-                        b_type,
-                        c_type,
-                        transpose_b,
-                        mma_shape = Index(64, 256, 16),
-                    ](
-                        block_tile_shape=Index(128, 256, 64),
-                        cluster_shape=Index(CLUSTER_DIM_X, 1, 1),
-                        num_pipeline_stages=4,
-                        num_consumer=2,
-                        partitioned_multicast=False,
-                        pdl_level=pdl_level,
-                    )
-                    warp_specialize_gemm_with_multicasting[
-                        transpose_b=transpose_b,
-                        elementwise_lambda_fn=elementwise_lambda_fn,
-                        elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                        config=H100_TUNING_CONFIG,
-                        grid_shape = Index(GRID_DIM_X, GRID_DIM_Y),
-                        schedule = MatmulSchedule.TILE2D,
-                    ](
-                        rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                        rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                        rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                        m,
-                        n,
-                        k,
-                        ctx,
-                    )
-                    return
-
-                else:
-                    multistage_gemm[
-                        transpose_b=transpose_b,
-                        config = kernels.tuning_config,
-                        elementwise_lambda_fn=elementwise_lambda_wrapper,
-                    ](
-                        rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                        rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                        rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                        kernels.tuning_config,
-                        ctx,
-                    )
-                    return
-
-            # Allow caller to overwrite dispatch heuristic with their own config.
-            @parameter
-            if config:
-                multistage_gemm[
-                    transpose_b=transpose_b,
-                    config = config.value(),
-                    elementwise_lambda_fn=elementwise_lambda_wrapper,
-                ](
-                    rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                    rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                    rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                    config.value(),
-                    ctx,
-                )
-                return
-
-            alias use_A100_kernels_on_H100 = env_get_int[
-                "USE_EXPERIMENTAL_KERNELS", 0
-            ]()
-
-            @parameter
-            if (
-                a_type == b_type
-                and a_type.is_half_float()
-                and ctx.device_info is H100
-                and transpose_b
-                and not use_A100_kernels_on_H100
-            ):
-                alias static_N = c_shape.get[1]()
-                alias static_K = a_shape.get[1]()
-
-                # GTC matmul configs
-                @parameter
-                if (
-                    a_type is DType.bfloat16
-                    and static_N == 2560
-                    and static_K == 8192
-                ):
-                    if m == 512:
-                        alias M512_N2560_K8192_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, 80, 16),
-                        ](
-                            block_tile_shape=Index(128, 80, 64),
-                            cluster_shape=Index(1, 2, 1),
-                            num_pipeline_stages=8,
-                            num_consumer=2,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=M512_N2560_K8192_config,
-                            # grid_shape = Index(32, 4),
-                            # schedule = MatmulSchedule.TILE2D,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-
-                    elif m == 8192:
-                        alias M8192_N2560_K8192_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, 256, 16),
-                        ](
-                            block_tile_shape=Index(128, 256, 64),
-                            cluster_shape=Index(1, 1, 1),
-                            num_pipeline_stages=4,
-                            num_consumer=2,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=M8192_N2560_K8192_config,
-                            grid_shape = Index(10, H100.sm_count // 10),
-                            schedule = MatmulSchedule.TILE2D,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-
-                    elif m == 4096:
-                        alias M4096_N2560_K8192_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, 256, 16),
-                        ](
-                            block_tile_shape=Index(128, 256, 64),
-                            cluster_shape=Index(2, 1, 1),
-                            num_pipeline_stages=4,
-                            num_consumer=2,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=M4096_N2560_K8192_config,
-                            schedule = MatmulSchedule.TILE2D,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-
-                @parameter
-                if (
-                    a_type is DType.bfloat16
-                    and static_N == 8192
-                    and static_K == 2048
-                ):
-                    if m == 8192:
-                        alias M8192_N8192_K2048_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, 256, 16),
-                        ](
-                            block_tile_shape=Index(128, 256, 64),
-                            cluster_shape=Index(2, 1, 1),
-                            num_pipeline_stages=4,
-                            num_consumer=2,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=M8192_N8192_K2048_config,
-                            grid_shape = Index(4, H100.sm_count // 4),
-                            schedule = MatmulSchedule.TILE2D,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-
-                    elif m == 4096:
-                        alias M4096_N8192_K2048_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, 256, 16),
-                        ](
-                            block_tile_shape=Index(128, 256, 64),
-                            cluster_shape=Index(2, 1, 1),
-                            num_pipeline_stages=4,
-                            num_consumer=2,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=M4096_N8192_K2048_config,
-                            schedule = MatmulSchedule.TILE2D,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-
-                @parameter
-                if (
-                    a_type is DType.bfloat16
-                    and static_N == 14336
-                    and static_K == 8192
-                ):
-                    if m == 8192:
-                        alias M8192_N14336_K8192_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, 256, 16),
-                        ](
-                            block_tile_shape=Index(128, 256, 64),
-                            cluster_shape=Index(2, 1, 1),
-                            num_pipeline_stages=4,
-                            num_consumer=2,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=M8192_N14336_K8192_config,
-                            grid_shape = Index(8, H100.sm_count // 8),
-                            schedule = MatmulSchedule.TILE2D,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-
-                    elif m == 4096:
-                        alias M4096_N14336_K8192_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, 256, 16),
-                        ](
-                            block_tile_shape=Index(128, 256, 64),
-                            cluster_shape=Index(2, 1, 1),
-                            num_pipeline_stages=4,
-                            num_consumer=2,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=M4096_N14336_K8192_config,
-                            schedule = MatmulSchedule.TILE2D,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-
-                @parameter
-                if (
-                    a_type is DType.bfloat16
-                    and static_N == 8192
-                    and static_K == 7168
-                ):
-                    if m == 8192:
-                        alias M8192_N8192_K7168_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, 256, 16),
-                        ](
-                            block_tile_shape=Index(128, 256, 64),
-                            cluster_shape=Index(2, 1, 1),
-                            num_pipeline_stages=4,
-                            num_consumer=2,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=M8192_N8192_K7168_config,
-                            grid_shape = Index(8, H100.sm_count // 8),
-                            schedule = MatmulSchedule.TILE2D,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-
-                    elif m == 4096:
-                        alias M4096_N8192_K7168_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, 256, 16),
-                        ](
-                            block_tile_shape=Index(128, 256, 64),
-                            cluster_shape=Index(2, 1, 1),
-                            num_pipeline_stages=4,
-                            num_consumer=2,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=M4096_N8192_K7168_config,
-                            schedule = MatmulSchedule.TILE2D,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-
-                alias BN = _find_largest_bn_for_sm90_matmul[static_N]()
-                alias BK = 64
-
-                @parameter
-                if a_type is DType.bfloat16 and BN != -1 and static_K % BK == 0:
-                    if m <= 128:
-                        alias default_bf16_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, BN, 16),
-                        ](
-                            block_tile_shape=Index(64, BN, BK),
-                            cluster_shape=Index(1, 1, 1),
-                            num_pipeline_stages=4,
-                            num_consumer=1,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=default_bf16_config,
-                            schedule = MatmulSchedule.NONE,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-                    else:
-                        alias default_bf16_config = MatmulConfig[
-                            a_type,
-                            b_type,
-                            c_type,
-                            transpose_b,
-                            mma_shape = Index(64, BN, 16),
-                        ](
-                            block_tile_shape=Index(128, BN, BK),
-                            cluster_shape=Index(1, 1, 1),
-                            num_pipeline_stages=4,
-                            num_consumer=2,
-                            partitioned_multicast=False,
-                            pdl_level=pdl_level,
-                        )
-                        warp_specialize_gemm_with_multicasting[
-                            transpose_b=transpose_b,
-                            elementwise_lambda_fn=elementwise_lambda_fn,
-                            elementwise_compute_lambda_fn=elementwise_compute_lambda_fn,
-                            config=default_bf16_config,
-                            schedule = MatmulSchedule.NONE,
-                        ](
-                            rebind[NDBuffer[c_type, 2, c.origin, c_shape]](c),
-                            rebind[NDBuffer[a_type, 2, a.origin, a_shape]](a),
-                            rebind[NDBuffer[b_type, 2, b.origin, b_shape]](b),
-                            m,
-                            n,
-                            k,
-                            ctx,
-                        )
-                        return
-
-            alias use_A100_kenrels = ctx.device_info is A100 or (
+            alias use_A100_kernels = ctx.device_info is A100 or (
                 ctx.device_info is H100 and use_A100_kernels_on_H100 != 0
             )
 
@@ -1526,7 +881,7 @@ fn _matmul_gpu[
             if (
                 a_type == b_type
                 and a_type.is_half_float()
-                and use_A100_kenrels
+                and use_A100_kernels
                 and transpose_b
             ):
                 alias static_K = a_shape.get[1]()
@@ -1673,26 +1028,86 @@ fn _matmul_gpu[
             ](c, a, b, ctx)
             return
 
-    alias BLOCK_DIM = 16
-    ctx.enqueue_function[
-        matmul_kernel_naive[
-            c_type,
-            a_type,
-            b_type,
-            BLOCK_DIM,
-            transpose_b,
-            elementwise_lambda_fn=elementwise_lambda_wrapper,
-        ]
-    ](
-        c.data,
-        a.data,
-        b.data,
-        m,
-        n,
-        k,
-        grid_dim=(ceildiv(m, BLOCK_DIM), ceildiv(n, BLOCK_DIM)),
-        block_dim=(BLOCK_DIM, BLOCK_DIM),
-    )
+    # compile time check to pass bro's req of only having support FP32, FP16 and BF16 for cublas wrapper
+    @parameter
+    if (
+        (
+            a_type is DType.float32
+            or a_type is DType.bfloat16
+            or a_type is DType.float16
+        )
+        and (
+            b_type is DType.float32
+            or b_type is DType.bfloat16
+            or b_type is DType.float16
+        )
+        and (
+            c_type is DType.float32
+            or c_type is DType.bfloat16
+            or c_type is DType.float16
+        )
+        # to disable vendor fallback, run export MODULAR_DISABLE_VENDOR_FALLBACK=1 in the environment
+        and not env_get_bool["MODULAR_DISABLE_VENDOR_FALLBACK", False]()
+    ):
+        logger.info("Executing: vendor BLAS fallback")
+        try:
+            return matmul_vendor[
+                use_tensor_core=use_tensor_core,
+                transpose_b=transpose_b,
+                elementwise_lambda_fn=elementwise_lambda_wrapper,
+                config=config,
+                _trace_description=_trace_description,
+            ](c, a, b, ctx)
+        except:
+            logger.warning("Vendor BLAS failed")
+            alias BLOCK_DIM = 16
+            ctx.enqueue_function[
+                matmul_kernel_naive[
+                    c_type,
+                    a_type,
+                    b_type,
+                    BLOCK_DIM,
+                    transpose_b,
+                    elementwise_lambda_fn=elementwise_lambda_wrapper,
+                ]
+            ](
+                c.data,
+                a.data,
+                b.data,
+                m,
+                n,
+                k,
+                grid_dim=(ceildiv(m, BLOCK_DIM), ceildiv(n, BLOCK_DIM)),
+                block_dim=(BLOCK_DIM, BLOCK_DIM),
+            )
+            return
+    else:
+        # For unsupported dtypes like FP8, directly use the naive implementation
+        logger.info("Unsupported dtypes or vendor disabled")
+        alias BLOCK_DIM = 16
+        logger.info(
+            "Executing: Naive MATMUL kernel (BLOCK_DIM=", BLOCK_DIM, ")"
+        )
+        ctx.enqueue_function[
+            matmul_kernel_naive[
+                c_type,
+                a_type,
+                b_type,
+                BLOCK_DIM,
+                transpose_b,
+                elementwise_lambda_fn=elementwise_lambda_wrapper,
+            ]
+        ](
+            c.data,
+            a.data,
+            b.data,
+            m,
+            n,
+            k,
+            grid_dim=(ceildiv(m, BLOCK_DIM), ceildiv(n, BLOCK_DIM)),
+            block_dim=(BLOCK_DIM, BLOCK_DIM),
+        )
+        return
 
 
 @always_inline
@@ -1707,7 +1122,7 @@ fn split_k_reduce[
     work_space: NDBuffer[work_space_type, 3, _, work_space_shape],
     ctx: DeviceContext,
 ) raises:
-    alias simd_width = simdwidthof[c_type, target = _get_gpu_target()]()
+    alias simd_width = simdwidthof[c_type, target = get_gpu_target()]()
     var num_partitions = work_space.dim[0]()
     var M = c.dim[0]()
     var N = c.dim[1]()
@@ -1761,6 +1176,12 @@ fn multistage_gemm[
     var M = c.dim[0]()
     var N = c.dim[1]()
 
+    var logger = Logger()
+    logger.info("------ Dispatching to Multistage GEMM ------")
+    logger.info(String(config))
+    logger.info("K partitions: ", runtime_config.num_k_partitions)
+    logger.info("Serial reduction: ", serial_reduction)
+
     var tensor_c = from_ndbuffer_row_major(c)
     var tensor_a = from_ndbuffer_row_major(a)
     var tensor_b = from_ndbuffer_row_major(b)
@@ -1769,6 +1190,7 @@ fn multistage_gemm[
 
         @parameter
         if serial_reduction:
+            logger.info("Executing: split-K with serial reduction (lock-based)")
             constrained[
                 c_type is DType.bfloat16,
                 "serial reduction is unsupported for this config",
@@ -1822,6 +1244,9 @@ fn multistage_gemm[
             return
 
         else:
+            logger.info(
+                "Executing: split-K with parallel reduction (workspace-based)"
+            )
             alias work_space_type = config.split_k_reduction_type
             var work_space_data = ctx.enqueue_create_buffer[work_space_type](
                 runtime_config.num_k_partitions * M * N
@@ -1887,7 +1312,8 @@ fn multistage_gemm[
     # Dispatch w/o split K
     @parameter
     if has_amd_gpu_accelerator() and transpose_b:
-        alias gemm_kernel_type = amd_gemm_kernel[
+        logger.info("Executing: AMD standard GEMM (no split-K)")
+        alias gemm_kernel_type = gemm_kernel_amd[
             c_type,
             tensor_c.layout,
             a_type,
@@ -1913,6 +1339,7 @@ fn multistage_gemm[
         )
 
     else:
+        logger.info("Executing: standard GEMM (no split-K)")
         alias gemm_kernel_type = multistage_gemm_kernel[
             c_type,
             tensor_c.layout,

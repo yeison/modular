@@ -22,19 +22,19 @@ from collections.abc import Iterable
 from typing import Optional
 
 import requests
+from max.interfaces import (
+    PipelineTokenizer,
+    TextGenerationRequest,
+    TokenGenerator,
+)
 from max.pipelines import (
     PIPELINE_REGISTRY,
     PipelineConfig,
 )
-from max.pipelines.core import (
-    PipelineTokenizer,
-    TokenGenerator,
-    TokenGeneratorRequest,
-)
 
 from .metrics import TextGenerationMetrics
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("max.entrypoints")
 
 MODEL_NAME = "model"
 
@@ -50,8 +50,8 @@ async def stream_text_to_console(
 ) -> None:
     req_id = str(uuid.uuid4())
     context = await tokenizer.new_context(
-        TokenGeneratorRequest(
-            id=req_id,
+        TextGenerationRequest(
+            request_id=req_id,
             index=0,
             prompt=prompt,
             images=images,
@@ -72,19 +72,15 @@ async def stream_text_to_console(
         generate_again = True
         while generate_again:
             responses = pipeline.next_token(
-                pipeline_request,
-                num_steps=num_steps,
+                pipeline_request, num_steps=num_steps
             )
 
-            for request_idx, response in responses.items():
+            for request_idx, response in responses.items():  # noqa: B007
                 if response.is_done:
                     generate_again = False
 
-                for text_response in response.tokens:
-                    encoded_text = text_response.next_token
-                    response_text = await tokenizer.decode(
-                        context, encoded_text
-                    )
+                for encoded_token in response.tokens:
+                    response_text = await tokenizer.decode(encoded_token)
                     if metrics:
                         if first_token:
                             first_token = False

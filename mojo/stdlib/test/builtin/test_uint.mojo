@@ -10,7 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo %s
 
 from sys import bitwidthof
 
@@ -174,9 +173,7 @@ def test_mod():
 
 
 def test_divmod():
-    var a: UInt
-    var b: UInt
-    a, b = divmod(UInt(7), UInt(3))
+    var a, b = divmod(UInt(7), UInt(3))
     assert_equal(a, UInt(2))
     assert_equal(b, UInt(1))
 
@@ -245,9 +242,9 @@ def test_pos():
 
 
 def test_hash():
-    assert_not_equal(UInt.__hash__(123), UInt.__hash__(456))
-    assert_equal(UInt.__hash__(123), UInt.__hash__(123))
-    assert_equal(UInt.__hash__(456), UInt.__hash__(456))
+    assert_not_equal(hash(UInt(123)), hash(UInt(456)))
+    assert_equal(hash(UInt(123)), hash(UInt(123)))
+    assert_equal(hash(UInt(456)), hash(UInt(456)))
 
 
 def test_comptime():

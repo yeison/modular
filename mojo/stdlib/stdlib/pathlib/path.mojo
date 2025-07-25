@@ -14,14 +14,12 @@
 """
 
 import os
-from collections import InlineArray, List
-from hashlib._hasher import _HashableWithHasher, _Hasher
+from hashlib.hasher import Hasher
 from os import PathLike, listdir, stat_result
 from sys import external_call, os_is_windows
 from sys.ffi import c_char
 
-from builtin._location import __call_location, _SourceLocation
-from memory import UnsafePointer
+from builtin._location import __call_location
 
 alias DIR_SEPARATOR = "\\" if os_is_windows() else "/"
 
@@ -62,17 +60,17 @@ fn _dir_of_current_file_impl(file_name: StaticString) raises -> Path:
     return Path(file_name[0:i])
 
 
-@value
 struct Path(
-    Stringable,
     Boolable,
-    Writable,
     Copyable,
-    Movable,
+    EqualityComparable,
     ExplicitlyCopyable,
-    PathLike,
+    Hashable,
     KeyElement,
-    _HashableWithHasher,
+    Movable,
+    PathLike,
+    Stringable,
+    Writable,
 ):
     """The Path object."""
 
@@ -93,7 +91,7 @@ struct Path(
         self.path = String(path)
 
     @implicit
-    fn __init__(out self, owned path: String):
+    fn __init__(out self, var path: String):
         """Initializes a path with the provided path.
 
         Args:
@@ -235,16 +233,7 @@ struct Path(
         """
         return not self == other
 
-    fn __hash__(self) -> UInt:
-        """Hash the underlying path string using builtin hash.
-
-        Returns:
-            An integer value containing the hash of the path string.
-        """
-
-        return hash(self.path)
-
-    fn __hash__[H: _Hasher](self, mut hasher: H):
+    fn __hash__[H: Hasher](self, mut hasher: H):
         """Updates hasher with the path string value.
 
         Parameters:

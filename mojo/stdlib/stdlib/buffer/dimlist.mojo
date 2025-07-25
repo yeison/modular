@@ -19,8 +19,7 @@ You can import these APIs from the `buffer` package. For example:
 from buffer import Dim
 ```
 """
-
-from utils import IndexList, StaticTuple
+from utils import IndexList
 
 # ===-----------------------------------------------------------------------===#
 # Dim
@@ -28,7 +27,15 @@ from utils import IndexList, StaticTuple
 
 
 @register_passable("trivial")
-struct Dim(Intable, Stringable, Writable, ImplicitlyBoolable, Indexer):
+struct Dim(
+    Defaultable,
+    EqualityComparable,
+    ImplicitlyBoolable,
+    Indexer,
+    Intable,
+    Stringable,
+    Writable,
+):
     """A static or dynamic dimension modeled with an optional integer.
 
     This class is meant to represent an optional static dimension. When a value
@@ -305,12 +312,7 @@ struct Dim(Intable, Stringable, Writable, ImplicitlyBoolable, Indexer):
 
 
 @register_passable("trivial")
-struct DimList(
-    Sized,
-    Stringable,
-    Representable,
-    Writable,
-):
+struct DimList(Representable, Sized, Stringable, Writable):
     """This type represents a list of dimensions. Each dimension may have a
     static value or not have a value, which represents a dynamic dimension."""
 
@@ -332,7 +334,7 @@ struct DimList(
 
     @always_inline("nodebug")
     @implicit
-    fn __init__[I: Indexer](out self, values: (I,)):
+    fn __init__[I: Indexer & Copyable & Movable](out self, values: (I,)):
         """Creates a dimension list from the given list of values.
 
         Parameters:
@@ -345,7 +347,10 @@ struct DimList(
 
     @always_inline("nodebug")
     @implicit
-    fn __init__[I0: Indexer, I1: Indexer](out self, values: (I0, I1)):
+    fn __init__[
+        I0: Indexer & Copyable & Movable,
+        I1: Indexer & Copyable & Movable,
+    ](out self, values: (I0, I1)):
         """Creates a dimension list from the given list of values.
 
         Parameters:
@@ -360,7 +365,9 @@ struct DimList(
     @always_inline("nodebug")
     @implicit
     fn __init__[
-        I0: Indexer, I1: Indexer, I2: Indexer
+        I0: Indexer & Copyable & Movable,
+        I1: Indexer & Copyable & Movable,
+        I2: Indexer & Copyable & Movable,
     ](out self, values: (I0, I1, I2)):
         """Creates a dimension list from the given list of values.
 
@@ -377,7 +384,10 @@ struct DimList(
         )
 
     @always_inline("nodebug")
-    fn __init__[I0: Indexer, I1: Indexer](out self, val0: I0, val1: I1):
+    fn __init__[
+        I0: Indexer & Copyable & Movable,
+        I1: Indexer & Copyable & Movable,
+    ](out self, val0: I0, val1: I1):
         """Creates a dimension list from the given list of values.
 
         Parameters:

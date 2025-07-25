@@ -14,20 +14,20 @@
 
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-import torch
 from max.driver import DeviceStream, Tensor
 from max.dtype import DType
 from max.graph.weights import WeightsAdapter, WeightsFormat
+from max.interfaces import (
+    GenerationStatus,
+    LogProbabilities,
+    TextGenerationOutput,
+)
 from max.nn.kv_cache import KVCacheInputsSequence
 from max.pipelines.core import (
-    InputContext,
-    TextGenerationResponse,
-    TextGenerationStatus,
-    TextResponse,
+    TTSContext,
 )
 from max.profiler import Tracer, traced
 
@@ -39,10 +39,6 @@ from .pipeline import (
 if TYPE_CHECKING:
     from .config import PipelineConfig
 
-T = TypeVar("T", bound=InputContext)
-
-logger = logging.getLogger("max.pipelines")
-
 
 class SpeechTokenGenerationPipeline(TextGenerationPipeline):
     def __init__(
@@ -53,23 +49,22 @@ class SpeechTokenGenerationPipeline(TextGenerationPipeline):
         weight_adapters: dict[WeightsFormat, WeightsAdapter],
     ) -> None:
         super().__init__(
-            pipeline_config,
-            pipeline_model,
-            eos_token_id,
-            weight_adapters,
+            pipeline_config, pipeline_model, eos_token_id, weight_adapters
         )
         self.d2h_stream = DeviceStream(self._devices[0])
 
     @traced
     def next_speech_token(
         self,
-        batch: dict[str, T],
+        batch: dict[str, TTSContext],
         num_steps: int,
         tokens_to_generate: dict[str, int],
-    ) -> dict[str, TextGenerationResponse]:
+    ) -> dict[str, TextGenerationOutput]:
         """Provided a batch, process batch inputs, execute the graph for num_steps in a multi-step scenario,
         then decode the tokens holistically and return the list of decoded tokens.
         """
+        if not batch or num_steps == 0:
+            return {}
         tracer: Tracer = Tracer("compute_parameters")
 
         # Flatten our batch for consistent indexing.
@@ -90,26 +85,83 @@ class SpeechTokenGenerationPipeline(TextGenerationPipeline):
         )
 
         if self._pipeline_config.sampling_config.do_penalties:
-            frequency_data = []
+            frequency_data = [
+                self._build_token_frequency_csr(context_batch, num_steps),
+                self._build_token_frequency_csr(
+                    context_batch, num_steps, include_prompt=True
+                ),
+            ]
 
-            # Only build penalty frequency data if frequency or presence penalties are actually used
-            if (
-                self._pipeline_config.sampling_config.frequency_penalty != 0
-                or self._pipeline_config.sampling_config.presence_penalty != 0
-            ):
-                frequency_data.append(
-                    self._build_token_frequency_csr(context_batch, num_steps)
+            frequency_penalty = Tensor.from_numpy(
+                np.array(
+                    [
+                        context.sampling_params.frequency_penalty
+                        for context in context_batch
+                    ],
+                    dtype=np.float32,
                 )
+            ).to(self._devices[0])
+            presence_penalty = Tensor.from_numpy(
+                np.array(
+                    [
+                        context.sampling_params.presence_penalty
+                        for context in context_batch
+                    ],
+                    dtype=np.float32,
+                )
+            ).to(self._devices[0])
+            repetition_penalty = Tensor.from_numpy(
+                np.array(
+                    [
+                        context.sampling_params.repetition_penalty
+                        for context in context_batch
+                    ],
+                    dtype=np.float32,
+                )
+            ).to(self._devices[0])
 
-            # Only build repetition frequency data if repetition penalty is actually used
-            if self._pipeline_config.sampling_config.repetition_penalty != 1:
-                frequency_data.append(
-                    self._build_token_frequency_csr(
-                        context_batch, num_steps, include_prompt=True
-                    )
-                )
         else:
+            self._check_need_penalties(context_batch)
             frequency_data = None
+            frequency_penalty = None
+            presence_penalty = None
+            repetition_penalty = None
+
+        min_tokens_masks = self._build_min_tokens_masks(
+            context_batch, num_steps
+        )
+
+        temperature = Tensor.from_numpy(
+            np.array(
+                [
+                    context.sampling_params.temperature
+                    for context in context_batch
+                ],
+                dtype=np.float32,
+            )
+        ).to(self._devices[0])
+        top_k_np = np.array(
+            [context.sampling_params.top_k for context in context_batch],
+            dtype=np.int64,
+        )
+        top_k = Tensor.from_numpy(top_k_np).to(self._devices[0])
+        max_k_np = np.array(np.max(top_k_np), dtype=np.int64)
+        max_k = Tensor.from_numpy(max_k_np)
+        top_p = Tensor.from_numpy(
+            np.array(
+                [context.sampling_params.top_p for context in context_batch],
+                dtype=np.float32,
+            )
+        ).to(self._devices[0])
+        seed = Tensor.from_numpy(
+            np.array(
+                [
+                    context.sampling_params.seed + context.current_length
+                    for context in context_batch
+                ],
+                dtype=np.uint64,
+            )
+        ).to(self._devices[0])
 
         curr_step_inputs = model_inputs
 
@@ -120,38 +172,50 @@ class SpeechTokenGenerationPipeline(TextGenerationPipeline):
 
             # Execute the model and get next tokens.
             model_outputs = self._pipeline_model.execute(
-                model_inputs=curr_step_inputs,
+                model_inputs=curr_step_inputs
             )
 
             if i > 0:
                 new_tokens_np = new_tokens.to_numpy()  # type: ignore
                 seq_has_eos |= np.isin(new_tokens_np, eos_token_list)
 
+            tensor_bitmask = None
             if bitmask is not None:
                 assert self.vocab_size is not None
-                bits = 2 ** torch.arange(32, dtype=torch.int32)
-                bitmask = (bitmask.unsqueeze(-1) & bits) != 0
-                bitmask = bitmask.reshape(
-                    len(context_batch),
-                    -1,
-                ).to(torch.bool)
+                bits = 2 ** np.arange(32, dtype=np.int32)
+                bitmask = (bitmask[..., np.newaxis] & bits) != 0
+                bitmask = bitmask.reshape(len(context_batch), -1).astype(
+                    np.bool_
+                )
                 bitmask = bitmask[:, 0 : self.vocab_size]
-
-                bitmask = Tensor.from_dlpack(bitmask).to(self._devices[0])
+                tensor_bitmask = Tensor.from_numpy(bitmask).to(self._devices[0])
 
             # Sample next token.
             tracer.next("sample_next_token")
-            new_tokens, new_generated_tokens = self.sample_logits(
+            new_tokens, new_generated_tokens, new_seed = self.sample_logits(
                 model_outputs.logits,
                 generated_tokens,
+                top_k,
+                max_k,
+                temperature,
+                top_p,
+                seed,
                 logit_offsets=model_outputs.logit_offsets,
-                bitmask=bitmask,
+                bitmask=tensor_bitmask,
                 frequency_data=frequency_data,
+                min_tokens_mask=min_tokens_masks[i]
+                if min_tokens_masks
+                else None,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                repetition_penalty=repetition_penalty,
             )
 
             assert isinstance(new_tokens, Tensor)
             assert isinstance(new_generated_tokens, Tensor)
+            assert isinstance(new_seed, Tensor)
             generated_tokens = new_generated_tokens
+            seed = new_seed
 
             # Check if we're on our last iteration. If so, skip preparing the next batch
             if i == num_steps - 1 or seq_has_eos.all():
@@ -191,27 +255,36 @@ class SpeechTokenGenerationPipeline(TextGenerationPipeline):
         num_steps = i + 1
 
         # Prepare the response, pruning away completed requests as we go.
-        res: dict[str, TextGenerationResponse] = {}
+        res: dict[str, TextGenerationOutput] = {}
         tracer.push("prepare_response")
         for batch_index, (request_id, context) in enumerate(batch.items()):
-            status = TextGenerationStatus.ACTIVE
-            res[request_id] = TextGenerationResponse([], status)
+            status = GenerationStatus.ACTIVE
+            start_log_probs: Optional[list[LogProbabilities]] = None
+            if context.log_probabilities:
+                start_log_probs = []
+
+            res[request_id] = TextGenerationOutput(
+                request_id=request_id,
+                tokens=[],
+                final_status=status,
+                log_probabilities=start_log_probs,
+            )
             num_valid_tokens = min(num_steps, tokens_to_generate[request_id])
             for step in range(num_valid_tokens):
                 # Convert to a Python scalar to improve serialization performance.
                 next_token = int(generated_tokens_host[batch_index, step])
 
-                context.update(
-                    new_token=next_token,
-                )
+                context.update(new_token=next_token)
 
-                res[request_id].update_status(context.status)
-                if context.is_done:
+                res[request_id].final_status = context.speech_token_status
+                if context.speech_token_status.is_done:
                     break
 
             # Walk outstanding completion tokens, and return to user.
             for token, log_probs in context.outstanding_completion_tokens():
-                res[request_id].append_token(TextResponse(token, log_probs))
+                res[request_id].tokens.append(token)
+                if log_probs and res[request_id].log_probabilities is not None:
+                    res[request_id].log_probabilities.append(log_probs)  # type: ignore
 
         # Update the cache lengths in our kv_cache manager.
         # This should be done after the contexts are updated.

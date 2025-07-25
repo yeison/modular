@@ -15,17 +15,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from itertools import islice
-from typing import Union, cast
 
 from max.dtype import DType
 from max.graph import (
     BufferValue,
     DeviceRef,
-    Graph,
     TensorType,
     TensorValue,
     TensorValueLike,
-    Type,
     Value,
     ops,
 )
@@ -51,7 +48,7 @@ def take(it: Iterable[Value], n: int) -> list[Value]:
 
 # TODO (pavan): clean up duplicate instances of distribute_value, shard_col_value,
 # shard_row_value across the codebase into a multi gpu utils file
-def distribute_value(v, devices: list[DeviceRef]):
+def distribute_value(v, devices: list[DeviceRef]):  # noqa: ANN001
     return [v.to(device) for device in devices]
 
 
@@ -65,7 +62,7 @@ class DistributedTransformerBlock(Module):
         attention_norm: DistributedRMSNorm,
         mlp_norm: DistributedRMSNorm,
         devices: list[DeviceRef],
-    ):
+    ) -> None:
         super().__init__()
         self.self_attn = attention
         self.mlp = mlp
@@ -117,7 +114,7 @@ class DistributedTransformer(Module):
         devices: list[DeviceRef],
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
         use_subgraphs: bool = False,
-    ):
+    ) -> None:
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -153,61 +150,22 @@ class DistributedTransformer(Module):
         input_row_offsets_ = distribute_value(input_row_offsets, self.devices)
 
         if self.use_subgraphs:
-            subgraph_input_types: list[Type] = [
+            subgraph_input_types = [
                 TensorType(DType.uint32, shape=(), device=DeviceRef.CPU()),
-                *[hidden.type for hidden in h],
-                *[signal_buffer.type for signal_buffer in signal_buffers],
-                *[kv_collection.type for kv_collection in kv_collections],
-                *[offset.type for offset in input_row_offsets_],
+                [hidden.type for hidden in h],
+                [signal_buffer.type for signal_buffer in signal_buffers],
+                [kv_collection.type for kv_collection in kv_collections],
+                [offset.type for offset in input_row_offsets_],
             ]
-            num_devices = len(self.devices)
             subgraph_layer = self.layers[0]
-            assert isinstance(subgraph_layer, DistributedTransformerBlock)
-            layer_weights = list(subgraph_layer.raw_state_dict().values())
             subgraph_weight_prefix = "layers.0."
 
-            with Graph.current.add_subgraph(
+            assert isinstance(subgraph_layer, DistributedTransformerBlock)
+            subgraph = subgraph_layer.build_subgraph(
                 "dist_transformer_block",
-                input_types=subgraph_input_types,
-            ) as subgraph:
-                inputs = iter(subgraph.inputs)
-                arg_layer_idx = next(inputs)
-                arg_xs = [x.tensor for x in take(inputs, num_devices)]
-                arg_signal_buffers = [
-                    x.buffer for x in take(inputs, num_devices)
-                ]
-                arg_kv_collections = cast(
-                    list[
-                        Union[
-                            ContinuousBatchingKVCacheCollection,
-                            PagedKVCacheCollection,
-                        ]
-                    ],
-                    take(inputs, num_devices),
-                )
-                arg_input_row_offsets = [
-                    x.tensor for x in take(inputs, num_devices)
-                ]
-
-                for weight in filter(
-                    lambda w: w.name.startswith(subgraph_weight_prefix),
-                    layer_weights,
-                ):
-                    weight._placeholder = True
-                    weight.name = weight.name.removeprefix(
-                        subgraph_weight_prefix
-                    )
-
-                # prevent re-entry
-                results = subgraph_layer(
-                    arg_layer_idx,
-                    arg_xs,
-                    arg_signal_buffers,
-                    arg_kv_collections,
-                    arg_input_row_offsets,
-                )
-
-                subgraph.output(*results)
+                subgraph_input_types,
+                subgraph_weight_prefix,
+            )
 
             for idx in range(len(self.layers)):
                 h = [
@@ -236,7 +194,8 @@ class DistributedTransformer(Module):
         last_token_h = ops.gather(h0, last_token_indices, axis=0)
         last_token_distributed = distribute_value(last_token_h, self.devices)
         last_logits = ops.cast(
-            self.lm_head(self.norm(last_token_distributed))[0], DType.float32
+            self.lm_head(self.norm(last_token_distributed), signal_buffers)[0],
+            DType.float32,
         )
 
         logits = None
@@ -255,7 +214,9 @@ class DistributedTransformer(Module):
             )
             last_indices = ops.reshape(offsets, shape=(-1,))
             logits = ops.gather(
-                ops.cast(self.lm_head(self.norm(h))[0], DType.float32),
+                ops.cast(
+                    self.lm_head(self.norm(h), signal_buffers)[0], DType.float32
+                ),
                 last_indices,
                 axis=0,
             )
@@ -267,7 +228,9 @@ class DistributedTransformer(Module):
                 device=self.devices[0],
             )
         elif self.return_logits == ReturnLogits.ALL:
-            logits = ops.cast(self.lm_head(self.norm(h))[0], DType.float32)
+            logits = ops.cast(
+                self.lm_head(self.norm(h), signal_buffers)[0], DType.float32
+            )
             offsets = input_row_offsets
 
         if logits is not None and offsets is not None:

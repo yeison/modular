@@ -26,36 +26,30 @@ from kernels.matrix_multiplication import MatrixMultiplication
 from kernels.causal_conv1d import CausalConv1Dgpu, CausalConv1Dcpu
 from kernels.top_k import TopK
 from math import iota
-from memory import AddressSpace, UnsafePointer
 from random import rand
 from sys import (
     argv,
     has_nvidia_gpu_accelerator,
     has_amd_gpu_accelerator,
-    sizeof,
 )
 from gpu.host import DeviceContext, DeviceBuffer
 from tensor_internal import (
     Input,
-    InputTensor,
     IOSpec,
     ManagedTensorSlice,
-    MutableInput,
     Output,
-    OutputTensor,
     StaticTensorSpec,
 )
-from utils import IndexList
 
 
 # Wrap a ManagedTensorSlice and DeviceBuffer as an owning Tensor
-@value
+@fieldwise_init
 struct Tensor[
     dtype: DType,
     rank: Int, //,
     io_spec: IOSpec,
     static_spec: StaticTensorSpec[dtype, rank],
-]:
+](Copyable, Movable):
     alias size = Int(static_spec.shape.product())
 
     var slice: ManagedTensorSlice[io_spec=io_spec, static_spec=static_spec]
@@ -175,7 +169,7 @@ def matmul():
     bench.bench_function[matmul_cpu](BenchId("cpu", "naive"), metrics)
 
     @parameter
-    if has_nvidia_gpu_accelerator():
+    if has_nvidia_gpu_accelerator() or has_amd_gpu_accelerator():
         var gpu_ctx = DeviceContext()
         var a_dev = Tensor[Input, a_spec](gpu_ctx).rand()
         var b_dev = Tensor[Input, b_spec](gpu_ctx).rand()

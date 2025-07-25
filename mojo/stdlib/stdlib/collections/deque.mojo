@@ -23,7 +23,6 @@ from collections import Deque
 
 
 from bit import next_power_of_two
-from memory import UnsafePointer
 
 # ===-----------------------------------------------------------------------===#
 # Deque
@@ -31,10 +30,7 @@ from memory import UnsafePointer
 
 
 struct Deque[ElementType: Copyable & Movable](
-    Boolable,
-    ExplicitlyCopyable,
-    Movable,
-    Sized,
+    Boolable, ExplicitlyCopyable, Movable, Sized
 ):
     """Implements a double-ended queue.
 
@@ -134,15 +130,16 @@ struct Deque[ElementType: Copyable & Movable](
         if elements is not None:
             self.extend(elements.value())
 
-    fn __init__(out self, owned *values: ElementType):
+    fn __init__(out self, var *values: ElementType, __list_literal__: () = ()):
         """Constructs a deque from the given values.
 
         Args:
             values: The values to populate the deque with.
+            __list_literal__: Tell Mojo to use this method for list literals.
         """
         self = Self(elements=values^)
 
-    fn __init__(out self, *, owned elements: VariadicListMem[ElementType, _]):
+    fn __init__(out self, *, var elements: VariadicListMem[ElementType, _]):
         """Constructs a deque from the given values.
 
         Args:
@@ -221,7 +218,7 @@ struct Deque[ElementType: Copyable & Movable](
             The newly created deque with the properties of `self`.
         """
         new = self.copy()
-        for ref element in other:
+        for element in other:
             new.append(element)
         return new^
 
@@ -231,7 +228,7 @@ struct Deque[ElementType: Copyable & Movable](
         Args:
             other: Deque whose elements will be appended to self.
         """
-        for ref element in other:
+        for element in other:
             self.append(element)
 
     fn __mul__(self, n: Int) -> Self:
@@ -252,7 +249,7 @@ struct Deque[ElementType: Copyable & Movable](
             )
         new = self.copy()
         for _ in range(n - 1):
-            for ref element in self:
+            for element in self:
                 new.append(element)
         return new^
 
@@ -268,7 +265,7 @@ struct Deque[ElementType: Copyable & Movable](
 
         orig = self.copy()
         for _ in range(n - 1):
-            for ref element in orig:
+            for element in orig:
                 self.append(element)
 
     fn __eq__[
@@ -482,7 +479,7 @@ struct Deque[ElementType: Copyable & Movable](
     # Methods
     # ===-------------------------------------------------------------------===#
 
-    fn append(mut self, owned value: ElementType):
+    fn append(mut self, var value: ElementType):
         """Appends a value to the right side of the deque.
 
         Args:
@@ -499,7 +496,7 @@ struct Deque[ElementType: Copyable & Movable](
         if self._head == self._tail:
             self._realloc(self._capacity << 1)
 
-    fn appendleft(mut self, owned value: ElementType):
+    fn appendleft(mut self, var value: ElementType):
         """Appends a value to the left side of the deque.
 
         Args:
@@ -552,14 +549,14 @@ struct Deque[ElementType: Copyable & Movable](
                 count += 1
         return count
 
-    fn extend(mut self, owned values: List[ElementType]):
+    fn extend(mut self, var values: List[ElementType]):
         """Extends the right side of the deque by consuming elements of the list argument.
 
         Args:
             values: List whose elements will be added at the right side of the deque.
         """
-        n_move_total, n_move_self, n_move_values, n_pop_self, n_pop_values = (
-            self._compute_pop_and_move_counts(len(self), len(values))
+        var n_move_total, n_move_self, n_move_values, n_pop_self, n_pop_values = self._compute_pop_and_move_counts(
+            len(self), len(values)
         )
 
         # pop excess `self` elements
@@ -584,7 +581,7 @@ struct Deque[ElementType: Copyable & Movable](
             (src + i).move_pointee_into(self._data + self._tail)
             self._tail = self._physical_index(self._tail + 1)
 
-    fn extendleft(mut self, owned values: List[ElementType]):
+    fn extendleft(mut self, var values: List[ElementType]):
         """Extends the left side of the deque by consuming elements from the list argument.
 
         Acts as series of left appends resulting in reversed order of elements in the list argument.
@@ -592,8 +589,8 @@ struct Deque[ElementType: Copyable & Movable](
         Args:
             values: List whose elements will be added at the left side of the deque.
         """
-        n_move_total, n_move_self, n_move_values, n_pop_self, n_pop_values = (
-            self._compute_pop_and_move_counts(len(self), len(values))
+        var n_move_total, n_move_self, n_move_values, n_pop_self, n_pop_values = self._compute_pop_and_move_counts(
+            len(self), len(values)
         )
 
         # pop excess `self` elements
@@ -667,7 +664,7 @@ struct Deque[ElementType: Copyable & Movable](
                 return idx
         raise "ValueError: Given element is not in deque"
 
-    fn insert(mut self, idx: Int, owned value: ElementType) raises:
+    fn insert(mut self, idx: Int, var value: ElementType) raises:
         """Inserts the `value` into the deque at position `idx`.
 
         Args:
@@ -988,7 +985,7 @@ struct _DequeIter[
     ElementType: Copyable & Movable,
     deque_lifetime: Origin[deque_mutability],
     forward: Bool = True,
-](Copyable, Movable):
+](Copyable, Iterator, Movable):
     """Iterator for Deque.
 
     Parameters:
@@ -999,6 +996,7 @@ struct _DequeIter[
     """
 
     alias deque_type = Deque[ElementType]
+    alias Element = ElementType
 
     var index: Int
     var src: Pointer[Self.deque_type, deque_lifetime]
@@ -1006,7 +1004,15 @@ struct _DequeIter[
     fn __iter__(self) -> Self:
         return self
 
-    fn __next__(mut self) -> ref [deque_lifetime] ElementType:
+    @always_inline
+    fn __has_next__(self) -> Bool:
+        @parameter
+        if forward:
+            return self.index < len(self.src[])
+        else:
+            return self.index > 0
+
+    fn __next_ref__(mut self) -> ref [deque_lifetime] ElementType:
         @parameter
         if forward:
             var idx = self.index
@@ -1016,13 +1022,5 @@ struct _DequeIter[
             self.index -= 1
             return self.src[][self.index]
 
-    fn __len__(self) -> Int:
-        @parameter
-        if forward:
-            return len(self.src[]) - self.index
-        else:
-            return self.index
-
-    @always_inline
-    fn __has_next__(self) -> Bool:
-        return self.__len__() > 0
+    fn __next__(mut self) -> ElementType:
+        return self.__next_ref__()

@@ -12,7 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 
-def update_simd(t: SIMD[DType.int32, 4]):
+def update_simd(var t: SIMD[DType.int32, 4]):
     t[0] = 9
     print("t:", t)
 

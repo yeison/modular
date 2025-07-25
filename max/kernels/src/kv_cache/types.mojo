@@ -23,8 +23,7 @@ This module defines two traits that define the roles of the different structs
 """
 
 from buffer import Dim, DimList, NDBuffer
-from layout import Layout, LayoutTensor
-from memory import UnsafePointer
+from layout import LayoutTensor
 
 from utils import Index, IndexList
 
@@ -64,8 +63,8 @@ fn _strides_from_shape[shape: DimList, *, skip: Int = 0]() -> DimList:
 
 @always_inline
 fn _compute_kv_cache_dynamic_shape_strides[
-    type: DType, rank: Int, //, kv_cache_rank: Int, drop_list: Tuple
-](blocks: NDBuffer[type, rank, **_]) -> (
+    dtype: DType, rank: Int, //, kv_cache_rank: Int, drop_list: Tuple
+](blocks: NDBuffer[dtype, rank, **_]) -> (
     IndexList[kv_cache_rank],
     IndexList[kv_cache_rank],
 ):
@@ -90,9 +89,9 @@ fn _compute_kv_cache_dynamic_shape_strides[
     return (kv_cache_shape, kv_cache_strides)
 
 
-@value
+@fieldwise_init
 @register_passable("trivial")
-struct KVCacheStaticParams(EqualityComparable):
+struct KVCacheStaticParams(Copyable, EqualityComparable, Movable):
     var num_heads: UInt
     var head_size: UInt
 
@@ -114,7 +113,7 @@ trait KVCacheT(Copyable, Movable):
     Represents a single (key or value) cache.
     """
 
-    alias type: DType
+    alias dtype: DType
     alias kv_params: KVCacheStaticParams
 
     fn cache_lengths_nd(self) -> NDBuffer[DType.uint32, 1, MutableAnyOrigin]:
@@ -128,7 +127,7 @@ trait KVCacheT(Copyable, Movable):
     fn load[
         width: Int
     ](self, bs: Int, head_idx: Int, tok_idx: Int, head_dim_idx: Int) -> SIMD[
-        Self.type, width
+        dtype, width
     ]:
         """Loads an element from the given index."""
         ...
@@ -139,7 +138,7 @@ trait KVCacheT(Copyable, Movable):
         head_idx: Int,
         tok_idx: Int,
         head_dim_idx: Int,
-        val: SIMD[Self.type, *_],
+        val: SIMD[dtype, *_],
     ):
         """Stores an element at the given index."""
         ...
@@ -169,7 +168,7 @@ trait KVCacheT(Copyable, Movable):
         start_tok_idx: Int,
         head_idx: Int,
         head_dim_idx: Int = 0,
-    ) -> UnsafePointer[Scalar[Self.type]]:
+    ) -> UnsafePointer[Scalar[dtype]]:
         """Returns a LayoutTensor pointing to the KVCache block at the given index.
 
         Paged KVCache implementations must have a block_size which is a multiple of the
@@ -183,22 +182,26 @@ trait KVCacheT(Copyable, Movable):
         ...
 
 
-@value
 @register_passable("trivial")
 struct ContinuousBatchingKVCache[
-    type_: DType,
+    dtype_: DType,
     kv_params_: KVCacheStaticParams,
-    assert_write_mode: WRITE_MODE = WRITE_MODE_REG,
 ](KVCacheT):
-    """Wrapper for the ContinuousKVCache of a given layer in the transformer model.
+    """Wrapper for the ContinuousKVCache of a given layer in the transformer
+    model.
 
-    This abstracts the Pointer indirection for accessing the ContinuousKVCache for a
-    given batch entry.
+    Parameters:
+        dtype_: The dtype of the kv-cache.
+        kv_params_: The kv-cache static parameters.
 
-    THIS IS THE TYPE THAT IS PASSED TO KV PROJECTION AND FLASH ATTENTION KERNELS.
+    This abstracts the Pointer indirection for accessing the ContinuousKVCache
+    for a given batch entry.
+
+    THIS IS THE TYPE THAT IS PASSED TO KV PROJECTION AND FLASH ATTENTION
+    KERNELS.
     """
 
-    alias type = type_
+    alias dtype = dtype_
     alias kv_params = kv_params_
 
     # Shape is [num_blocks, max_seq_len, num_heads, head_size].
@@ -210,7 +213,7 @@ struct ContinuousBatchingKVCache[
     )
     alias blocks_stride = _strides_from_shape[Self.blocks_shape, skip=1]()
     alias blocks_type = NDBuffer[
-        Self.type, 4, MutableAnyOrigin, Self.blocks_shape, Self.blocks_stride
+        Self.dtype, 4, MutableAnyOrigin, Self.blocks_shape, Self.blocks_stride
     ]
 
     var blocks: Self.blocks_type
@@ -230,14 +233,15 @@ struct ContinuousBatchingKVCache[
     fn _get_idx_tuple(
         self, block_idx: Int, head_idx: Int, tok_idx: Int, head_dim_idx: Int
     ) -> IndexList[4]:
-        debug_assert[assert_write_mode](
-            head_idx < Self.kv_params.num_heads, "KVCache head_idx out of range"
+        debug_assert(
+            UInt(head_idx) < Self.kv_params.num_heads,
+            "KVCache head_idx out of range",
         )
-        debug_assert[assert_write_mode](
-            head_dim_idx < Self.kv_params.head_size,
+        debug_assert(
+            UInt(head_dim_idx) < Self.kv_params.head_size,
             "KVCache head_dim_idx is out of range",
         )
-        debug_assert[assert_write_mode](
+        debug_assert(
             tok_idx < self.blocks.dim[1](),
             "KVCache tok_idx out of range",
         )
@@ -256,11 +260,11 @@ struct ContinuousBatchingKVCache[
         max_seq_length: UInt32,
         max_cache_length: UInt32,
     ):
-        debug_assert[assert_write_mode](
+        debug_assert(
             blocks.dim[2]() == Int(Self.kv_params.num_heads),
             "blocks.dim[2]() must be equal to kv_params.num_heads",
         )
-        debug_assert[assert_write_mode](
+        debug_assert(
             blocks.dim[3]() == Int(Self.kv_params.head_size),
             "blocks.dim[3]() must be equal to kv_params.head_size",
         )
@@ -281,7 +285,7 @@ struct ContinuousBatchingKVCache[
 
     @always_inline
     fn cache_length(self, batch_idx: Int) -> Int:
-        debug_assert[assert_write_mode](
+        debug_assert(
             batch_idx < self._batch_size(), "KVCache batch_idx is out of bounds"
         )
         return Int(self.cache_lengths[batch_idx][0])
@@ -290,9 +294,9 @@ struct ContinuousBatchingKVCache[
     fn load[
         width: Int
     ](self, bs: Int, head_idx: Int, tok_idx: Int, head_dim_idx: Int) -> SIMD[
-        Self.type, width
+        Self.dtype, width
     ]:
-        debug_assert[assert_write_mode](
+        debug_assert(
             bs < self._batch_size(),
             "KVCache::load batch_size out of range",
         )
@@ -310,9 +314,9 @@ struct ContinuousBatchingKVCache[
         head_idx: Int,
         tok_idx: Int,
         head_dim_idx: Int,
-        val: SIMD[Self.type, *_],
+        val: SIMD[Self.dtype, *_],
     ):
-        debug_assert[assert_write_mode](
+        debug_assert(
             bs < self._batch_size(),
             "KVCache::store batch_size out of range",
         )
@@ -346,7 +350,7 @@ struct ContinuousBatchingKVCache[
         start_tok_idx: Int,
         head_idx: Int,
         head_dim_idx: Int = 0,
-    ) -> UnsafePointer[Scalar[Self.type]]:
+    ) -> UnsafePointer[Scalar[Self.dtype]]:
         var block_idx = Int(self.lookup_table[batch_idx])
         var full_block_idx = self._get_idx_tuple(
             block_idx, head_idx, start_tok_idx, head_dim_idx
@@ -355,19 +359,22 @@ struct ContinuousBatchingKVCache[
         return offset_ptr
 
 
-@value
 @register_passable("trivial")
 struct PagedKVCache[
-    type_: DType,
+    dtype_: DType,
     kv_params_: KVCacheStaticParams,
     page_size: Int,
-    assert_write_mode: WRITE_MODE = WRITE_MODE_REG,
 ](KVCacheT):
     """The PagedKVCache is a wrapper around the KVCache blocks for a given layer.
     It is used to access the KVCache blocks for PagedAttention.
+
+    Parameters:
+        dtype_: The dtype of the kv-cache.
+        kv_params_: The kv-cache static parameters.
+        page_size: The size of the page.
     """
 
-    alias type = type_
+    alias dtype = dtype_
     alias kv_params = kv_params_
 
     # Shape is [total_num_blocks, page_size, num_heads, head_size].
@@ -379,7 +386,7 @@ struct PagedKVCache[
     )
     alias blocks_stride = _strides_from_shape[Self.blocks_shape, skip=1]()
     alias blocks_type = NDBuffer[
-        Self.type, 4, MutableAnyOrigin, Self.blocks_shape, Self.blocks_stride
+        Self.dtype, 4, MutableAnyOrigin, Self.blocks_shape, Self.blocks_stride
     ]
 
     var blocks: Self.blocks_type
@@ -403,15 +410,15 @@ struct PagedKVCache[
         max_seq_length: UInt32,
         max_cache_length: UInt32,
     ):
-        debug_assert[assert_write_mode](
+        debug_assert(
             blocks.dim[1]() == page_size,
             "blocks.dim[1]() must be equal to page_size",
         )
-        debug_assert[assert_write_mode](
+        debug_assert(
             blocks.dim[2]() == Int(Self.kv_params.num_heads),
             "blocks.dim[2]() must be equal to kv_params.num_heads",
         )
-        debug_assert[assert_write_mode](
+        debug_assert(
             blocks.dim[3]() == Int(Self.kv_params.head_size),
             "blocks.dim[3]() must be equal to kv_params.head_size",
         )
@@ -439,28 +446,26 @@ struct PagedKVCache[
     fn _get_idx(
         self, bs: Int, head_idx: Int, tok_idx: Int, head_dim_idx: Int
     ) -> IndexList[4]:
-        debug_assert[assert_write_mode](
-            head_idx < Self.kv_params.num_heads,
+        debug_assert(
+            UInt(head_idx) < Self.kv_params.num_heads,
             "KVCache head_idx out of range (",
             head_idx,
             ")",
         )
-        debug_assert[assert_write_mode](
-            head_dim_idx < Self.kv_params.head_size,
+        debug_assert(
+            UInt(head_dim_idx) < Self.kv_params.head_size,
             "KVCache head_dim_idx is out of range",
         )
 
-        lut_block_index, tok_in_block_idx = divmod(tok_idx, self.page_size)
+        var lut_block_index, tok_in_block_idx = divmod(tok_idx, self.page_size)
 
-        debug_assert[assert_write_mode](
+        debug_assert(
             tok_in_block_idx < self.blocks.dim[1](),
             "KVCache tok_idx out of range",
         )
 
-        debug_assert[assert_write_mode](
-            bs < len(self.cache_lengths), "batch_idx is oob"
-        )
-        debug_assert[assert_write_mode](
+        debug_assert(bs < len(self.cache_lengths), "batch_idx is oob")
+        debug_assert(
             lut_block_index < self.page_size,
             "block_idx is OOB. Attempted to access block index ",
             lut_block_index,
@@ -474,7 +479,7 @@ struct PagedKVCache[
     fn load[
         width: Int
     ](self, bs: Int, head_idx: Int, tok_idx: Int, head_dim_idx: Int) -> SIMD[
-        Self.type, width
+        Self.dtype, width
     ]:
         """Loads an element from the given index."""
         var idx = self._get_idx(bs, head_idx, tok_idx, head_dim_idx)
@@ -487,7 +492,7 @@ struct PagedKVCache[
         head_idx: Int,
         tok_idx: Int,
         head_dim_idx: Int,
-        val: SIMD[Self.type, *_],
+        val: SIMD[Self.dtype, *_],
     ):
         """Stores an element at the given index."""
         var idx = self._get_idx(bs, head_idx, tok_idx, head_dim_idx)
@@ -517,7 +522,7 @@ struct PagedKVCache[
         start_tok_idx: Int,
         head_idx: Int,
         head_dim_idx: Int = 0,
-    ) -> UnsafePointer[Scalar[Self.type]]:
+    ) -> UnsafePointer[Scalar[Self.dtype]]:
         constrained[
             tile_size <= page_size and page_size % tile_size == 0,
             (
@@ -539,7 +544,7 @@ trait KVCollectionT(Copyable, Movable):
 
     alias CacheType: KVCacheT
     alias name_str: StaticString
-    alias type: DType
+    alias dtype: DType
     alias kv_params: KVCacheStaticParams
 
     fn get_key_cache(self, layer_idx: Int) -> Self.CacheType:
@@ -553,24 +558,25 @@ trait KVCollectionT(Copyable, Movable):
 
 
 struct ContinuousBatchingKVCacheCollection[
-    type_: DType,
+    dtype_: DType,
     kv_params_: KVCacheStaticParams,
-    assert_write_mode: WRITE_MODE = WRITE_MODE_REG,
 ](KVCollectionT):
     """This is a "view" of the cache for the given sequences
     in the batch.
 
+    Parameters:
+        dtype_: The dtype of the kv-cache.
+        kv_params_: The kv-cache static parameters.
+
     This object does not own the underlying buffers in k_cache and v_cache,
     it's borrowing them from the BlockWrappers in our KVCacheManager.
-    It does own the Pointer[NDBuffer[type, 3]] and valid_lengths buffer
+    It does own the Pointer[NDBuffer[dtype, 3]] and valid_lengths buffer
     """
 
     alias name_str = "continuous_batching"
-    alias type = type_
+    alias dtype = dtype_
     alias kv_params = kv_params_
-    alias CacheType = ContinuousBatchingKVCache[
-        Self.type, Self.kv_params, Self.assert_write_mode
-    ]
+    alias CacheType = ContinuousBatchingKVCache[Self.dtype, Self.kv_params]
 
     # Shape is [num_blocks, 2, num_layers, max_seq_len, num_heads, head_size].
     alias blocks_shape = DimList(
@@ -583,7 +589,7 @@ struct ContinuousBatchingKVCacheCollection[
     )
     alias blocks_stride = _strides_from_shape[Self.blocks_shape]()
     alias blocks_type = NDBuffer[
-        Self.type, 6, MutableAnyOrigin, Self.blocks_shape, Self.blocks_stride
+        Self.dtype, 6, MutableAnyOrigin, Self.blocks_shape, Self.blocks_stride
     ]
 
     var cache_lengths: NDBuffer[DType.uint32, 1, MutableAnyOrigin]
@@ -596,7 +602,7 @@ struct ContinuousBatchingKVCacheCollection[
 
     fn __init__(
         out self,
-        blocks: NDBuffer[Self.type, 6, MutableAnyOrigin],
+        blocks: NDBuffer[Self.dtype, 6, MutableAnyOrigin],
         cache_lengths: NDBuffer[DType.uint32, 1, MutableAnyOrigin],
         lookup_table: NDBuffer[DType.uint32, 1, MutableAnyOrigin],
         max_seq_length: UInt32,
@@ -649,17 +655,14 @@ struct ContinuousBatchingKVCacheCollection[
 
 
 struct PagedKVCacheCollection[
-    type_: DType,
+    dtype_: DType,
     kv_params_: KVCacheStaticParams,
     page_size: Int,
-    assert_write_mode: WRITE_MODE = WRITE_MODE_REG,
 ](KVCollectionT):
     alias name_str = "paged"
-    alias type = type_
+    alias dtype = dtype_
     alias kv_params = kv_params_
-    alias CacheType = PagedKVCache[
-        Self.type, Self.kv_params, page_size, Self.assert_write_mode
-    ]
+    alias CacheType = PagedKVCache[Self.dtype, Self.kv_params, page_size]
 
     # Shape is [total_num_blocks, 2, num_layers, page_size, num_heads, head_size].
     alias blocks_shape = DimList(
@@ -672,7 +675,7 @@ struct PagedKVCacheCollection[
     )
     alias blocks_stride = _strides_from_shape[Self.blocks_shape]()
     alias blocks_type = NDBuffer[
-        Self.type, 6, MutableAnyOrigin, Self.blocks_shape, Self.blocks_stride
+        Self.dtype, 6, MutableAnyOrigin, Self.blocks_shape, Self.blocks_stride
     ]
 
     var blocks: Self.blocks_type
@@ -685,7 +688,7 @@ struct PagedKVCacheCollection[
 
     fn __init__(
         out self,
-        blocks: NDBuffer[Self.type, 6, MutableAnyOrigin],
+        blocks: NDBuffer[Self.dtype, 6, MutableAnyOrigin],
         cache_lengths: NDBuffer[DType.uint32, 1, MutableAnyOrigin],
         lookup_table: NDBuffer[DType.uint32, 2, MutableAnyOrigin],
         max_seq_length: UInt32,

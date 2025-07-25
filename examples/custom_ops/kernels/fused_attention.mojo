@@ -53,24 +53,19 @@ leading to the final output.
 
 
 from math import exp
-from os import abort
-from sys import argv
 
-from algorithm import parallelize_over_rows
 from compiler import register
 from gpu.host import DeviceContext
 from gpu.id import block_idx
 from gpu.memory import AddressSpace
 from gpu.sync import barrier
-from layout import Layout, LayoutTensor, RuntimeLayout, RuntimeTuple
+from layout import Layout, LayoutTensor
 from layout.math import max, sum
 from layout.tensor_core import TensorCore
-from python import Python, PythonObject
 from runtime.asyncrt import DeviceContextPtr
 from tensor_internal import InputTensor, OutputTensor
 
 from utils import Index
-from utils.index import IndexList
 
 
 @register("modular_ops::fused_attention_custom")

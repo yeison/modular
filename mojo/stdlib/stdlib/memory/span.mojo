@@ -20,14 +20,14 @@ from memory import Span
 ```
 """
 
-from collections import InlineArray
 from sys.info import simdwidthof
 
-from memory import Pointer, UnsafePointer
+from collections._index_normalization import normalize_index
+from memory import Pointer
 from memory.unsafe_pointer import _default_alignment
 
 
-@value
+@fieldwise_init
 struct _SpanIter[
     mut: Bool, //,
     T: Copyable & Movable,
@@ -35,7 +35,7 @@ struct _SpanIter[
     forward: Bool = True,
     address_space: AddressSpace = AddressSpace.GENERIC,
     alignment: Int = _default_alignment[T](),
-]:
+](Copyable, Movable):
     """Iterator for Span.
 
     Parameters:
@@ -56,7 +56,15 @@ struct _SpanIter[
         return self
 
     @always_inline
-    fn __next__(mut self) -> ref [origin, address_space] T:
+    fn __has_next__(self) -> Bool:
+        @parameter
+        if forward:
+            return self.index < len(self.src)
+        else:
+            return self.index > 0
+
+    @always_inline
+    fn __next_ref__(mut self) -> ref [origin, address_space] T:
         @parameter
         if forward:
             self.index += 1
@@ -65,20 +73,8 @@ struct _SpanIter[
             self.index -= 1
             return self.src[self.index]
 
-    @always_inline
-    fn __has_next__(self) -> Bool:
-        return self.__len__() > 0
 
-    @always_inline
-    fn __len__(self) -> Int:
-        @parameter
-        if forward:
-            return len(self.src) - self.index
-        else:
-            return self.index
-
-
-@value
+@fieldwise_init
 @register_passable("trivial")
 struct Span[
     mut: Bool, //,
@@ -87,7 +83,7 @@ struct Span[
     *,
     address_space: AddressSpace = AddressSpace.GENERIC,
     alignment: Int = _default_alignment[T](),
-](ExplicitlyCopyable, Copyable, Movable, Sized):
+](ExplicitlyCopyable, Copyable, Movable, Sized, Boolable, Defaultable):
     """A non-owning view of contiguous data.
 
     Parameters:
@@ -99,9 +95,9 @@ struct Span[
     """
 
     # Aliases
-    alias Mutable = Span[T, MutableOrigin.cast_from[origin].result]
+    alias Mutable = Span[T, MutableOrigin.cast_from[origin]]
     """The mutable version of the `Span`."""
-    alias Immutable = Span[T, ImmutableOrigin.cast_from[origin].result]
+    alias Immutable = Span[T, ImmutableOrigin.cast_from[origin]]
     """The immutable version of the `Span`."""
     # Fields
     var _data: UnsafePointer[
@@ -120,7 +116,7 @@ struct Span[
     @always_inline("nodebug")
     fn __init__(out self):
         """Create an empty / zero-length span."""
-        self._data = __type_of(self._data)()
+        self._data = {}
         self._len = 0
 
     @doc_private
@@ -128,7 +124,7 @@ struct Span[
     @always_inline("nodebug")
     fn __init__(
         other: Span[T, _],
-        out self: Span[T, ImmutableOrigin.cast_from[other.origin].result],
+        out self: Span[T, ImmutableOrigin.cast_from[other.origin]],
     ):
         """Implicitly cast the mutable origin of self to an immutable one.
 
@@ -141,7 +137,13 @@ struct Span[
     fn __init__(
         out self,
         *,
-        ptr: UnsafePointer[T, address_space=address_space, alignment=alignment],
+        ptr: UnsafePointer[
+            T,
+            address_space=address_space,
+            alignment=alignment,
+            mut=mut,
+            origin=origin, **_,
+        ],
         length: UInt,
     ):
         """Unsafe construction from a pointer and length.
@@ -151,7 +153,7 @@ struct Span[
             length: The length of the view.
         """
         self._data = ptr
-        self._len = length
+        self._len = Int(length)
 
     @always_inline
     fn copy(self) -> Self:
@@ -170,7 +172,12 @@ struct Span[
         Args:
             list: The list to which the span refers.
         """
-        self._data = list.data.address_space_cast[address_space]()
+        self._data = (
+            list.unsafe_ptr()
+            .address_space_cast[address_space]()
+            .static_alignment_cast[alignment]()
+            .origin_cast[mut, origin]()
+        )
         self._len = list._len
 
     @always_inline
@@ -191,6 +198,8 @@ struct Span[
             UnsafePointer(to=array)
             .bitcast[T]()
             .address_space_cast[address_space]()
+            .static_alignment_cast[alignment]()
+            .origin_cast[mut, origin]()
         )
         self._len = size
 
@@ -211,15 +220,10 @@ struct Span[
         Returns:
             An element reference.
         """
-        # TODO: Simplify this with a UInt type.
-        debug_assert(
-            -self._len <= Int(idx) < self._len, "index must be within bounds"
+        var normalized_idx = normalize_index["Span", assert_always=False](
+            idx, len(self)
         )
-        # TODO(MSTDL-1086): optimize away SIMD/UInt normalization check
-        var offset = Int(idx)
-        if offset < 0:
-            offset += len(self)
-        return self._data[offset]
+        return self._data[normalized_idx]
 
     @always_inline
     fn __getitem__(self, slc: Slice) -> Self:
@@ -235,10 +239,7 @@ struct Span[
             This function allocates when the step is negative, to avoid a memory
             leak, take ownership of the value.
         """
-        var start: Int
-        var end: Int
-        var step: Int
-        start, end, step = slc.indices(len(self))
+        var start, end, step = slc.indices(len(self))
 
         # TODO: Introduce a new slice type that just has a start+end but no
         # step.  Mojo supports slice type inference that can express this in the
@@ -291,7 +292,7 @@ struct Span[
     # Trait implementations
     # ===------------------------------------------------------------------===#
 
-    @always_inline
+    @always_inline("builtin")
     fn __len__(self) -> Int:
         """Returns the length of the span. This is a known constant value.
 
@@ -357,7 +358,7 @@ struct Span[
         """
         return rebind[Self.Immutable](self)
 
-    @always_inline
+    @always_inline("builtin")
     fn unsafe_ptr(
         self,
     ) -> UnsafePointer[
@@ -538,4 +539,7 @@ struct Span[
         Returns:
             A pointer merged with the specified `other_type`.
         """
-        return __type_of(result)(self._data, self._len)
+        return __type_of(result)(
+            ptr=self._data.origin_cast[result.mut, result.origin](),
+            length=self._len,
+        )

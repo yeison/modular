@@ -25,6 +25,7 @@ from max.dtype import DType
 from max.engine import InferenceSession, Model
 from max.graph import DeviceRef, Graph, TensorType
 from max.graph.weights import SafetensorWeights, Weights, WeightsAdapter
+from max.interfaces import LogProbabilities
 from max.nn import ReturnLogits
 from max.nn.kv_cache import (
     KVCacheInputs,
@@ -33,7 +34,7 @@ from max.nn.kv_cache import (
     estimate_kv_cache_size,
     load_kv_manager,
 )
-from max.pipelines.core import LogProbabilities, TextContext
+from max.pipelines.core import TextContext
 from max.pipelines.lib import (
     KVCacheConfig,
     ModelInputs,
@@ -43,7 +44,10 @@ from max.pipelines.lib import (
     SupportedEncoding,
     upper_bounded_default,
 )
-from max.pipelines.lib.log_probabilities import compute_log_probabilities_ragged
+from max.pipelines.lib.log_probabilities import (
+    compute_log_probabilities_ragged,
+    log_probabilities_ragged_graph,
+)
 from transformers import AutoConfig
 
 from .deepseekV2 import DeepseekV2
@@ -84,7 +88,7 @@ class DeepseekV2Inputs(ModelInputs):
             self.return_n_logits = return_n_logits
 
 
-class DeepseekV2Model(PipelineModel[TextContext]):
+class DeepseekV2Model(PipelineModel[TextContext]):  # type: ignore
     def __init__(
         self,
         pipeline_config: PipelineConfig,
@@ -115,6 +119,8 @@ class DeepseekV2Model(PipelineModel[TextContext]):
         )
         self.return_n_logits = return_n_logits
         self.model = self.load_model(session)
+        self.logprobs_device = devices[0]
+        self.logprobs_model = self.load_logprobs_model(session)
 
     def execute(
         self,
@@ -152,8 +158,7 @@ class DeepseekV2Model(PipelineModel[TextContext]):
         # Get input_row_offsets: start and end position of each batch in the
         # combined total_seq_len dimension.
         input_row_offsets = np.cumsum(
-            [0] + [ctx.active_length for ctx in context_batch],
-            dtype=np.uint32,
+            [0] + [ctx.active_length for ctx in context_batch], dtype=np.uint32
         )
 
         # Create a ragged token vector of length: sum(len(t) for t in tokens).
@@ -265,18 +270,14 @@ class DeepseekV2Model(PipelineModel[TextContext]):
             ),
             max_batch_size=pipeline_config.max_batch_size,
             max_seq_len=cls.calculate_max_seq_len(
-                pipeline_config,
-                huggingface_config=huggingface_config,
+                pipeline_config, huggingface_config=huggingface_config
             ),
             num_layers=huggingface_config.num_hidden_layers,
             available_cache_memory=available_cache_memory,
             devices=devices,
         )
 
-    def load_model(
-        self,
-        session: InferenceSession,
-    ) -> Model:
+    def load_model(self, session: InferenceSession) -> Model:
         # Pre-allocate a buffer for input_row_offsets in multistep execution.
         # We do this to avoid materializing and copying a buffer with each multistep step
         assert self.pipeline_config.max_batch_size, (
@@ -375,9 +376,7 @@ class DeepseekV2Model(PipelineModel[TextContext]):
             device=DeviceRef.GPU(),
         )
         return_n_logits_type = TensorType(
-            DType.int64,
-            shape=["return_n_logits"],
-            device=DeviceRef.GPU(),
+            DType.int64, shape=["return_n_logits"], device=DeviceRef.GPU()
         )
         kv_cache_types = self.kv_manager.input_symbols()[0]
         with Graph(
@@ -409,20 +408,25 @@ class DeepseekV2Model(PipelineModel[TextContext]):
         )
         return model
 
+    def load_logprobs_model(self, session: InferenceSession) -> Model:
+        # TODO: Perhaps 'levels' ought to be configurable.
+        graph = log_probabilities_ragged_graph(
+            DeviceRef.from_device(self.logprobs_device), levels=3
+        )
+        return session.load(graph)
+
     def compute_log_probabilities(
         self,
+        session: InferenceSession,
         model_inputs: ModelInputs,
         model_outputs: ModelOutputs,
         next_tokens: Tensor,
         batch_top_n: list[int],
         batch_echo: list[bool],
     ) -> list[LogProbabilities | None] | None:
-        if model_outputs.logits is not None:
-            logits = model_outputs.logits.to_numpy()
-        else:
-            logits = None
+        logits = model_outputs.logits
         assert model_outputs.next_token_logits is not None
-        next_token_logits = model_outputs.next_token_logits.to_numpy()
+        next_token_logits = model_outputs.next_token_logits
         sampled_tokens = next_tokens.to_numpy()
 
         model_inputs = cast(DeepseekV2Inputs, model_inputs)
@@ -430,6 +434,8 @@ class DeepseekV2Model(PipelineModel[TextContext]):
         input_row_offsets = model_inputs.input_row_offsets.to_numpy()
 
         return compute_log_probabilities_ragged(
+            self.logprobs_device,
+            self.logprobs_model,
             input_row_offsets=input_row_offsets,
             logits=logits,
             next_token_logits=next_token_logits,

@@ -56,14 +56,12 @@ var total_size = size(shape)  # Results in 120
 ```
 """
 
-import sys
-from collections import InlineArray, List
 from os import abort
 
 from buffer import DimList
 from builtin.range import _StridedRange
-from memory import UnsafePointer, memcpy
-from memory.pointer import AddressSpace, _GPUAddressSpace
+from memory import memcpy
+from memory.pointer import _GPUAddressSpace
 
 from utils.numerics import max_finite
 
@@ -288,8 +286,12 @@ that are not known at compile time or have not been specified.
 
 
 @register_passable("trivial")
-struct _IntTupleIter[origin: ImmutableOrigin, tuple_origin: ImmutableOrigin]:
+struct _IntTupleIter[origin: ImmutableOrigin, tuple_origin: ImmutableOrigin](
+    Iterator
+):
     """Iterator for traversing elements of an IntTuple."""
+
+    alias Element = IntTuple[origin]
 
     var src: Pointer[IntTuple[tuple_origin], origin]
     """Pointer to the source IntTuple being iterated."""
@@ -306,31 +308,26 @@ struct _IntTupleIter[origin: ImmutableOrigin, tuple_origin: ImmutableOrigin]:
         self.idx = idx
 
     @always_inline("nodebug")
+    fn __has_next__(self) -> Bool:
+        return self.idx < len(self.src[])
+
+    @always_inline("nodebug")
     fn __next__(mut self) -> IntTuple[origin]:
         """Get the next element and advance the iterator."""
         var idx = self.idx
         self.idx += 1
         return self.src[][idx]
 
-    @always_inline("nodebug")
-    fn __has_next__(self) -> Bool:
-        """Check if there are more elements to iterate."""
-        return self.__len__() > 0
-
-    @always_inline("nodebug")
-    fn __len__(self) -> Int:
-        """Get the number of remaining elements in the iteration."""
-        return len(self.src[]) - self.idx
-
 
 struct IntTuple[origin: ImmutableOrigin = __origin_of()](
     Copyable,
+    Defaultable,
+    EqualityComparable,
+    Intable,
     Movable,
     Sized,
     Stringable,
     Writable,
-    EqualityComparable,
-    Intable,
 ):
     """A hierarchical, nested tuple of integers with efficient memory management.
 
@@ -378,7 +375,7 @@ struct IntTuple[origin: ImmutableOrigin = __origin_of()](
             The total storage size required for all elements.
         """
         var size = 0
-        for ref v in elements:
+        for v in elements:
             # the size of the sub tuple plus the element
             size += v.size() + 1
         return size
@@ -556,6 +553,15 @@ struct IntTuple[origin: ImmutableOrigin = __origin_of()](
             non_owned: The `IntArray` to use as storage without taking ownership.
         """
         self._store = IntArray(non_owned=non_owned)
+
+    @always_inline("nodebug")
+    fn __init__(out self, *, var _owned: IntArray):
+        """Initialize an `IntTuple` taking the values of an `IntArray`.
+
+        Args:
+            _owned: The `IntArray` to use as storage.
+        """
+        self._store = _owned^
 
     @always_inline
     fn __init__(out self, existing: Self, rng: _StridedRange):
@@ -811,7 +817,7 @@ struct IntTuple[origin: ImmutableOrigin = __origin_of()](
                 count += self[i].count_values()
         return count
 
-    fn _fill(mut self, src: IntTuple, owned i: Int = 1) -> Int:
+    fn _fill(mut self, src: IntTuple, var i: Int = 1) -> Int:
         for j in range(len(src)):
             if src.is_value(j):
                 self._store[i] = src.value(j)
@@ -1127,10 +1133,7 @@ struct IntTuple[origin: ImmutableOrigin = __origin_of()](
         Returns:
             A new `IntTuple` containing the specified elements.
         """
-        var start: Int
-        var end: Int
-        var step: Int
-        start, end, step = span.indices(len(self))
+        var start, end, step = span.indices(len(self))
         return Self(self, range(start, end, step))
 
     @always_inline("nodebug")
@@ -1364,6 +1367,23 @@ struct IntTuple[origin: ImmutableOrigin = __origin_of()](
         """
         return self.value()
 
+    @always_inline("nodebug")
+    fn __merge_with__[
+        other_type: __type_of(IntTuple[_]),
+    ](var self) -> IntTuple[__origin_of(origin, other_type.origin)]:
+        """Returns an IntTuple with merged origins.  Used for if/then and
+        list literals.
+
+        Parameters:
+            other_type: The type of the IntTuple to merge with.
+
+        Returns:
+            An IntTuple that will work.
+        """
+        return IntTuple[__origin_of(origin, other_type.origin)](
+            _owned=self._store
+        )
+
 
 @always_inline("nodebug")
 fn signum(a: Int) -> Int:
@@ -1452,9 +1472,10 @@ fn is_tuple(t: IntTuple) -> Bool:
     return t.is_tuple()
 
 
-@value
-struct _ZipIter[origin: ImmutableOrigin, n: Int]:
+struct _ZipIter[origin: ImmutableOrigin, n: Int](Copyable, Movable):
     """Iterator for zipped `IntTuple` collections."""
+
+    alias Element = IntTuple[origin]
 
     var index: Int
     var ts: InlineArray[Pointer[IntTuple, origin], n]
@@ -1474,6 +1495,10 @@ struct _ZipIter[origin: ImmutableOrigin, n: Int]:
         for i in range(1, n):
             min_len = min(min_len, len(self.ts[i][]))
         self.len = min_len
+
+    @always_inline("nodebug")
+    fn __has_next__(self) -> Bool:
+        return self.index < self.len
 
     @always_inline("nodebug")
     fn __next__(mut self) -> IntTuple[origin]:
@@ -1501,19 +1526,9 @@ struct _ZipIter[origin: ImmutableOrigin, n: Int]:
                 result.append(self.ts[i][][idx])
             return result
 
-    @always_inline("nodebug")
-    fn __has_next__(self) -> Bool:
-        """Check if there are more elements to iterate over."""
-        return self.__len__() > 0
 
-    @always_inline("nodebug")
-    fn __len__(self) -> Int:
-        """Get the number of remaining elements."""
-        return self.len - self.index
-
-
-@value
-struct _zip[origin: ImmutableOrigin, n: Int]:
+@fieldwise_init
+struct _zip[origin: ImmutableOrigin, n: Int](Copyable, Movable):
     """Container for zipped `IntTuple` collections."""
 
     var ts: InlineArray[Pointer[IntTuple, origin], n]

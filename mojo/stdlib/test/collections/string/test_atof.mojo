@@ -10,7 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo %s
 
 from math import inf, isinf, isnan
 
@@ -82,7 +81,7 @@ def test_error_cases():
         _ = atof(".")
 
     # TODO:
-    # This should actualy work and approximate to the closest float64
+    # This should actually work and approximate to the closest float64
     # but we don't support it yet. See the section
     # 11, "Processing long numbers quickly" in the paper
     # Number Parsing at a Gigabyte per Second by Daniel Lemire
@@ -139,9 +138,9 @@ alias numbers_to_test = [
 
 def test_atof_generate_cases():
     for number, number_as_str in numbers_to_test:
-        for suffix in [String(""), "f", "F"]:
-            for exponent in [String("e"), "E"]:
-                for multiplier in [String(""), "-"]:
+        for suffix in ["", "f", "F"]:
+            for exponent in ["e", "E"]:
+                for multiplier in ["", "-"]:
                     var sign: Float64 = 1
                     if multiplier == "-":
                         sign = -1

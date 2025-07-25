@@ -21,8 +21,8 @@ from typing import Callable
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, Weight, ops
 from max.nn import RMSNorm
+from max.nn.attention import MHAMaskVariant
 from max.nn.kernels import (
-    MHAMaskVariant,
     flash_attention_ragged,
     fused_qk_ragged_rope,
     fused_qkv_ragged_matmul,
@@ -35,7 +35,7 @@ from max.nn.kv_cache import (
 )
 from max.nn.layer import Module
 from max.nn.linear import Linear
-from max.nn.rotary_embedding import OptimizedRotaryEmbedding
+from max.nn.rotary_embedding import RotaryEmbedding
 
 
 class Qwen3Attention(Module):
@@ -49,7 +49,7 @@ class Qwen3Attention(Module):
     def __init__(
         self,
         *,
-        rope: OptimizedRotaryEmbedding,
+        rope: RotaryEmbedding,
         num_attention_heads: int,
         num_key_value_heads: int,
         hidden_size: int,
@@ -61,7 +61,7 @@ class Qwen3Attention(Module):
         scale: float | None = None,
         has_bias: bool = False,
         qk_norm_eps: float = 1e-6,
-    ):
+    ) -> None:
         """Initializes the attention layer.
 
         Args:
@@ -103,10 +103,16 @@ class Qwen3Attention(Module):
             )
 
         self.q_norm = RMSNorm(
-            self.kv_params.head_dim, dtype=dtype, eps=self.qk_norm_eps
+            self.kv_params.head_dim,
+            dtype=dtype,
+            eps=self.qk_norm_eps,
+            multiply_before_cast=False,
         )
         self.k_norm = RMSNorm(
-            self.kv_params.head_dim, dtype=dtype, eps=self.qk_norm_eps
+            self.kv_params.head_dim,
+            dtype=dtype,
+            eps=self.qk_norm_eps,
+            multiply_before_cast=False,
         )
         self.q_weight_dim = self.kv_params.head_dim * num_attention_heads
         self.kv_weight_dim = self.kv_params.head_dim * num_key_value_heads
@@ -212,6 +218,8 @@ class Qwen3Attention(Module):
             total_seq_len=total_seq_len,
             input_row_offsets=input_row_offsets,
             weight_offset=0.0,
+            multiply_before_cast=False,
+            per_head_norm=True,
         )
 
         # Apply rotary embedding.

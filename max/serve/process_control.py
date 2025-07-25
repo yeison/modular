@@ -23,9 +23,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Union
 
-logger = logging.getLogger(__name__)
-# This logger is too verbose to expose to end users. Disable propagation to the root logger by default.
-logger.propagate = False
+logger = logging.getLogger("max.serve.process_control")
 
 
 class EventCreator(Protocol):
@@ -72,7 +70,7 @@ class ProcessControl:
 
     In addition to the explicit signalling between parent & process, the
     process itself can be alive or dead. It is useful to list the possible
-    combinations of singal and process-liveness:
+    combinations of signal and process-liveness:
         alive: Is the process running?
         started: Has user code signaled that it has started?
         completed: Has user code signaled that it is completed?
@@ -80,7 +78,7 @@ class ProcessControl:
         N N Y - should never happen
         N Y N - process started, but is now dead
         N Y Y - process started, completed, and is now dead
-        Y N N - proces started, but no user code signaled anything
+        Y N N - process started, but no user code signaled anything
         Y N Y - should never happen
         Y Y N - process is actively working
         Y Y Y - process has completed, is still alive, but *ought* exit soon
@@ -96,7 +94,7 @@ class ProcessControl:
         name: str,
         # TODO: we temporarily set it to 1 minute to handle long context input
         health_fail_s: float = 60.0,
-    ):
+    ) -> None:
         self.name = name
         self.started_event = ctx.Event()
         self.completed_event = ctx.Event()
@@ -192,18 +190,12 @@ class ProcessMonitor:
 
     async def until_healthy(self) -> bool:
         return await _until_true(
-            self.pc.is_healthy,
-            self.poll_s,
-            self.max_time_s,
+            self.pc.is_healthy, self.poll_s, self.max_time_s
         )
 
     async def until_dead_no_timeout(self) -> bool:
         is_dead = lambda: not self.proc.is_alive()
-        return await _until_true(
-            is_dead,
-            self.unhealthy_poll_s,
-            None,
-        )
+        return await _until_true(is_dead, self.unhealthy_poll_s, None)
 
     async def until_unhealthy(self) -> bool:
         return await _until_true(
@@ -212,7 +204,7 @@ class ProcessMonitor:
             self.unhealthy_max_time_s,
         )
 
-    async def shutdown(self):
+    async def shutdown(self) -> None:
         logger.info("Shutting down")
         self.pc.set_canceled()
         if not self.proc.is_alive():
@@ -226,8 +218,7 @@ class ProcessMonitor:
         dead_task = loop.create_task(self.until_dead())
 
         completed_tasks, pending_tasks = await asyncio.wait(
-            [completed_task, dead_task],
-            return_when=asyncio.FIRST_COMPLETED,
+            [completed_task, dead_task], return_when=asyncio.FIRST_COMPLETED
         )
 
         if completed_task.done():
@@ -245,7 +236,7 @@ class ProcessMonitor:
 
     async def shutdown_if_unhealthy(
         self, cb: Optional[Callable[[], None]] = None
-    ):
+    ) -> None:
         try:
             await self.until_unhealthy()
         except asyncio.CancelledError:
@@ -265,7 +256,9 @@ class ProcessMonitor:
                     pass
             await self.shutdown()
 
-    async def shutdown_if_dead(self, cb: Optional[Callable[[], None]] = None):
+    async def shutdown_if_dead(
+        self, cb: Optional[Callable[[], None]] = None
+    ) -> None:
         try:
             await self.until_dead_no_timeout()
         except asyncio.CancelledError:

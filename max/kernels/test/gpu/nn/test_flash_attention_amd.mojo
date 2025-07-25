@@ -12,7 +12,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from collections import OptionalReg
-from math import ceildiv, isclose, isqrt
+from math import isclose
 from random import rand
 from sys import argv
 
@@ -20,10 +20,7 @@ from buffer import NDBuffer
 from buffer.dimlist import Dim, DimList
 from gpu import *
 from gpu.host import DeviceContext
-from gpu.host.info import DEFAULT_GPU_ARCH
-from internal_utils import assert_with_measure
-from internal_utils._measure import cosine
-from memory import UnsafePointer, memset_zero
+from memory import memset_zero
 from nn.mha import (
     _naive_attention_with_transpose,
     flash_attention,
@@ -34,7 +31,6 @@ from nn.mha_score_mod import IdentityScoreMod
 from testing import assert_almost_equal
 
 from utils.index import Index
-from utils.numerics import min_or_neg_inf, neg_inf
 
 
 fn is_benchmark() -> Bool:
@@ -128,7 +124,7 @@ fn test[
         rand[qkv_type](v_ptr, v_size)
 
     memset_zero(mask_ptr, mask_size)
-    # Contruct buffers.
+    # Construct buffers.
     var q = NDBuffer[qkv_type, 4](
         q_ptr, Index(batch_size, seq_len, num_heads, depth)
     )
@@ -174,7 +170,7 @@ fn test[
     ctx.enqueue_copy(v_device_ptr, v_ptr)
     ctx.enqueue_copy(mask_device_ptr, mask_ptr)
 
-    # Contruct device buffers.
+    # Construct device buffers.
     var q_device = NDBuffer[
         qkv_type, 4, _, DimList(Dim(), Dim(), num_heads, depth)
     ](

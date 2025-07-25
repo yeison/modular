@@ -21,11 +21,8 @@ from random import seed
 
 import math
 from math import floor
-from sys import bitwidthof, external_call
-from sys.ffi import OpaquePointer
+from sys import external_call
 from time import perf_counter_ns
-
-from memory import UnsafePointer
 
 
 fn _get_random_state() -> OpaquePointer:
@@ -37,7 +34,7 @@ fn _get_random_state() -> OpaquePointer:
 
 fn seed():
     """Seeds the random number generator using the current time."""
-    seed(perf_counter_ns())
+    seed(Int(perf_counter_ns()))
 
 
 fn seed(a: Int):

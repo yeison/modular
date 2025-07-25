@@ -27,10 +27,9 @@ from os import abort
 from os.atomic import Consistency
 from sys import is_amd_gpu, is_nvidia_gpu, llvm_intrinsic
 from sys._assembly import inlined_assembly
-from sys.info import _is_sm_9x
 from sys.param_env import env_get_bool
-
-from memory import UnsafePointer
+from sys.info import CompilationTarget
+from gpu.intrinsics import Scope
 from memory.pointer import AddressSpace
 
 from ._utils import to_i32, to_llvm_shared_mem_ptr
@@ -44,9 +43,13 @@ alias _USE_EXPERIMENTAL_AMD_BLOCK_SYNC_LDS_WITHOUT_SYNC_VMEM = env_get_bool[
     "USE_EXPERIMENTAL_AMD_BLOCK_SYNC_LDS_WITHOUT_SYNC_VMEM", False
 ]()
 
+alias MaxHardwareBarriers = 16
+
 
 @always_inline("nodebug")
-fn named_barrier[num_threads: Int32, id: Int32 = 0]():
+fn named_barrier[
+    num_threads: Int32,
+](id: Int32 = 0):
     """Performs a named synchronization barrier at the block level.
 
     This function creates a synchronization point using a specific barrier ID, allowing
@@ -56,6 +59,8 @@ fn named_barrier[num_threads: Int32, id: Int32 = 0]():
 
     Parameters:
         num_threads: The number of threads that must reach the barrier before any can proceed.
+
+    Args:
         id: The barrier identifier (0-16). Default is 0.
 
     Notes:
@@ -67,7 +72,8 @@ fn named_barrier[num_threads: Int32, id: Int32 = 0]():
         - The barrier ID must not exceed 16.
         - All threads participating in the barrier must specify the same num_threads value.
     """
-    constrained[id <= 16, "barrier id should not exceed 16"]()
+
+    debug_assert(id < MaxHardwareBarriers, "barrier id should not exceed 16")
     constrained[
         is_nvidia_gpu(), "named barrier is only supported by NVIDIA GPUs"
     ]()
@@ -92,7 +98,7 @@ fn barrier():
         constrained[is_amd_gpu()]()
         llvm_intrinsic["llvm.amdgcn.s.waitcnt", NoneType](Int32(0xC07F))
         llvm_intrinsic["llvm.amdgcn.s.barrier", NoneType]()
-    else:
+    elif is_amd_gpu():
         __mlir_op.`pop.fence`[
             _type=None,
             syncscope = "workgroup".value,
@@ -104,6 +110,8 @@ fn barrier():
             syncscope = "workgroup".value,
             ordering = Consistency.ACQUIRE.__mlir_attr(),
         ]()
+    else:
+        return CompilationTarget.unsupported_target_error[operation="barrier"]()
 
 
 @fieldwise_init
@@ -324,9 +332,13 @@ fn syncwarp(mask: Int = -1):
         __mlir_op.`nvvm.bar.warp.sync`(
             __mlir_op.`index.casts`[_type = __mlir_type.i32](mask.value)
         )
-    else:
+    elif is_amd_gpu():
         # In AMD GPU this is a nop (everything executed in lock-step).
         return
+    else:
+        return CompilationTarget.unsupported_target_error[
+            operation="syncwarp"
+        ]()
 
 
 # ===-----------------------------------------------------------------------===#
@@ -385,8 +397,9 @@ fn async_copy_arrive[
     if is_nvidia_gpu():
         _mbarrier_impl(address)
     else:
-        constrained[
-            False, "The mbarrier function is not supported on AMD GPUs."
+        return CompilationTarget.unsupported_target_error[
+            operation="async_copy_arrive",
+            note="async_copy_arrive() is only supported when targeting NVIDIA GPUs",
         ]()
 
 
@@ -418,8 +431,9 @@ fn mbarrier_init[
             shared_mem, num_threads
         )
     else:
-        constrained[
-            False, "The mbarrier_init function is not supported on AMD GPUs."
+        return CompilationTarget.unsupported_target_error[
+            operation="mbarrier_init",
+            note="mbarrier_init() is only supported when targeting NVIDIA GPUs",
         ]()
 
 
@@ -450,10 +464,11 @@ fn mbarrier_arrive[
             shared_mem
         )
     else:
-        constrained[
-            False, "The mbarrier_arrive function is not supported on AMD GPUs."
+        return CompilationTarget.unsupported_target_error[
+            Int,
+            operation="mbarrier_arrive",
+            note="mbarrier_arrive() is only supported when targeting NVIDIA GPUs",
         ]()
-        return abort[Int]("function not available")
 
 
 @always_inline("nodebug")
@@ -487,11 +502,11 @@ fn mbarrier_test_wait[
             shared_mem, state
         )
     else:
-        constrained[
-            False,
-            "The mbarrier_test_wait function is not supported on AMD GPUs.",
+        return CompilationTarget.unsupported_target_error[
+            Bool,
+            operation="mbarrier_test_wait",
+            note="mbarrier_test_wair() is only supported when targeting NVIDIA GPUs",
         ]()
-        return abort[Bool]("function not available")
 
 
 @always_inline("nodebug")
@@ -520,13 +535,87 @@ fn mbarrier_arrive_expect_tx_shared[
             to_llvm_shared_mem_ptr(addr), to_i32(tx_count)
         )
     else:
+        return CompilationTarget.unsupported_target_error[
+            operation="mbarrier_arrive_expect_tx_shared",
+            note="mbarrier_arrive_expect_tx_shared() is only supported when targeting NVIDIA GPUs",
+        ]()
+
+
+@always_inline("nodebug")
+fn mbarrier_arrive_expect_tx_relaxed[
+    type: AnyType,  # The type of the memory barrier
+    scope: Scope = Scope.BLOCK,
+    space: Scope = Scope.BLOCK,
+](
+    addr: UnsafePointer[type, address_space = GPUAddressSpace.SHARED, **_],
+    tx_count: Int32,
+) -> UInt64:
+    """Configure a shared memory barrier to expect additional async transactions.
+
+    Updates the current phase of the memory barrier to track completion of
+    additional asynchronous transactions. Only supported on NVIDIA GPUs.
+
+    Parameters:
+        type: The type of the memory barrier.
+        scope: The scope of the memory barrier.
+        space: The space of the memory barrier.
+
+    Args:
+        addr: Pointer to the shared memory barrier.
+        tx_count: Number of expected transactions to track.
+
+    Returns:
+        The state.
+    """
+
+    constrained[
+        scope == Scope.BLOCK or scope == Scope.CLUSTER,
+        (
+            "mbarrier_arrive_expect_tx_relaxed scope is only supported for"
+            " cluster or block/CTA scope."
+        ),
+    ]()
+
+    constrained[
+        space == Scope.BLOCK or space == Scope.CLUSTER,
+        (
+            "mbarrier_arrive_expect_tx_relaxed space is only supported for"
+            " cluster or block/CTA scope."
+        ),
+    ]()
+
+    @parameter
+    if space == Scope.CLUSTER:
         constrained[
-            False,
+            scope == Scope.CLUSTER,
             (
-                "The mbarrier_arrive_expect_tx_shared function is not supported"
-                " on AMD GPUs."
+                "mbarrier_arrive_expect_tx_relaxed scope and space must be the"
+                " same if space is cluster."
             ),
         ]()
+
+    @parameter
+    if is_nvidia_gpu():
+        alias asm = (
+            """mbarrier.arrive.expect_tx.relaxed."""
+            + scope.mnemonic()
+            + """.shared::"""
+            + space.mnemonic()
+            + """.b64 $0, [$1], $2;"""
+        )
+        return inlined_assembly[
+            asm,
+            UInt64,
+            constraints="=l,r,r",
+            has_side_effect=True,
+        ](addr, tx_count)
+    else:
+        return CompilationTarget.unsupported_target_error[
+            UInt64,
+            operation="mbarrier_arrive_expect_tx_relaxed",
+            note="mbarrier_arrive_expect_tx_relaxed() is only supported when targeting NVIDIA GPUs",
+        ]()
+    return 0
 
 
 @always_inline("nodebug")
@@ -557,12 +646,9 @@ fn mbarrier_try_wait_parity_shared[
             to_llvm_shared_mem_ptr(addr), to_i32(phase), to_i32(ticks)
         )
     else:
-        constrained[
-            False,
-            (
-                "The mbarrier_try_wait_parity_shared function is not supported"
-                " on AMD GPUs."
-            ),
+        return CompilationTarget.unsupported_target_error[
+            operation="mbarrier_try_wait_parity_shared",
+            note="mbarrier_try_wait_parity_shared() is only supported when targeting NVIDIA GPUs",
         ]()
 
 
@@ -586,12 +672,9 @@ fn cp_async_bulk_commit_group():
     if is_nvidia_gpu():
         __mlir_op.`nvvm.cp.async.bulk.commit.group`[_type=None]()
     else:
-        constrained[
-            False,
-            (
-                "The cp_async_bulk_commit_group function is not supported"
-                " on AMD GPUs."
-            ),
+        return CompilationTarget.unsupported_target_error[
+            operation="cp_async_bulk_commit_group",
+            note="cp_async_bulk_commit_group() is only supported when targeting NVIDIA GPUs",
         ]()
 
 
@@ -640,10 +723,7 @@ fn cp_async_bulk_wait_group[n: Int32, read: Bool = True]():
         ](n)
 
     else:
-        constrained[
-            False,
-            (
-                "The cp_async_bulk_commit_group function is not supported"
-                " on AMD GPUs."
-            ),
+        return CompilationTarget.unsupported_target_error[
+            operation="cp_async_bulk_wait_group",
+            note="cp_async_bulk_wait_group() is only supported when targeting NVIDIA GPUs",
         ]()

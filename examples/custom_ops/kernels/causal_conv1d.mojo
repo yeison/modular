@@ -16,30 +16,20 @@ The code implements the causal 1D convolution based
 similar to the code in
 https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_fwd.cu
 And intended to showcase use of LayoutTensor use example of implementing an
-Improved peformance compared to naive implemetnation
+Improved performance compared to naive implementation
 """
 
 
-from algorithm import parallelize_over_rows
 from compiler import register
-from gpu.host import DeviceContext, DeviceBuffer
+from gpu.host import DeviceContext
 from gpu.id import block_idx
-from gpu.memory import AddressSpace
-from gpu.sync import barrier
-from layout import Layout, LayoutTensor, RuntimeLayout, RuntimeTuple
-from layout.math import max, sum
-from layout.layout_tensor import copy_dram_to_sram, copy_sram_to_dram
+from layout import Layout, LayoutTensor
+from layout.math import max
 from runtime.asyncrt import DeviceContextPtr
 from tensor_internal import InputTensor, OutputTensor
 from math import exp, ceildiv
 
 from utils import Index
-from utils.index import IndexList
-from python import Python, PythonObject
-from os import abort
-from sys import argv
-
-from memory import UnsafePointer
 
 
 @register("causal_conv1d_cpu")
@@ -164,10 +154,10 @@ fn causal_conv1d_cpu[
 
 
 # The conv1D gpu code is an example implementation that uses LayoutTensor
-# to perform a 1D filter on the signal dimention using SIMD access pattern
+# to perform a 1D filter on the signal dimension using SIMD access pattern
 # and SIMD operations on the GPU, this code wasn't not intended to achieve
 # the most optimal implementation, but to show a meaningful gains versus a
-# naive implemention that works well across GPU architectures and using
+# naive implementation that works well across GPU architectures and using
 # float32 and bfloat16
 fn causal_conv1d_kernel[
     dtype: DType,
@@ -186,7 +176,7 @@ fn causal_conv1d_kernel[
 ):
     var seq_length = input.shape[2]()
 
-    # Use the 3D grid to iterate over the batch, channel and sequence length dimentions
+    # Use the 3D grid to iterate over the batch, channel and sequence length dimensions
     tidx = thread_idx.x
     batch_id = block_idx.z
     channel_id = block_idx.y
@@ -206,7 +196,7 @@ fn causal_conv1d_kernel[
     var input_chunk: SIMD[dtype, elements]
 
     W_v = weight.vectorize[1, width]()
-    W = rebind[__type_of(W)](W_v[channel_id])
+    W = rebind[__type_of(W)](W_v[0, channel_id])
     B = rebind[__type_of(B)](bias[channel_id])
 
     var input_v = input.reshape[layout_2d]().vectorize[1, elements]()
@@ -233,7 +223,7 @@ fn causal_conv1d_kernel[
 
     x_vals = prev_input_chunk.join(input_chunk)
 
-    # The convolution filter operates on the preceeding input singal positions
+    # The convolution filter operates on the preceding input signal positions
     # Use SIMD primitives to implement the dot product
     @parameter
     for i in range(elements):
@@ -273,7 +263,7 @@ def causal_conv1d_gpu[
     ]
 
     # Map the problem to the 3D grid to iterate over
-    # the batch, channel and chunk the sequence lenght
+    # the batch, channel and chunk the sequence length
     ctx.enqueue_function[kernel_func, dump_asm=False](
         input,
         weight,

@@ -14,62 +14,31 @@
 from typing import Callable as _Callable
 from typing import Union as _Union
 
-from .context import InputContext, TextAndVisionContext, TextContext, TTSContext
+from max.interfaces import TokenGenerator
+
+from .context import TextAndVisionContext, TextContext, TTSContext
 from .interfaces import (
-    AudioGenerationRequest,
-    AudioGenerationResponse,
     AudioGenerator,
     AudioGeneratorContext,
-    AudioGeneratorOutput,
     EmbeddingsGenerator,
-    EmbeddingsResponse,
-    LogProbabilities,
-    PipelineAudioTokenizer,
-    PipelineTask,
-    PipelineTokenizer,
-    SamplingParams,
-    TextGenerationResponse,
-    TextGenerationStatus,
-    TextResponse,
-    TokenGenerator,
-    TokenGeneratorContext,
-    TokenGeneratorRequest,
-    TokenGeneratorRequestFunction,
-    TokenGeneratorRequestMessage,
-    TokenGeneratorRequestTool,
-    TokenGeneratorResponseFormat,
 )
+from .serialization import msgpack_numpy_decoder, msgpack_numpy_encoder
 
 PipelinesFactory = _Callable[
     [], _Union[TokenGenerator, EmbeddingsGenerator, AudioGenerator]
 ]
 
 __all__ = [
-    "AudioGenerationRequest",
-    "AudioGenerationResponse",
     "AudioGenerator",
     "AudioGeneratorContext",
-    "AudioGeneratorOutput",
     "EmbeddingsGenerator",
-    "EmbeddingsResponse",
-    "InputContext",
-    "LogProbabilities",
-    "PipelineAudioTokenizer",
-    "PipelineTask",
-    "PipelineTokenizer",
     "PipelinesFactory",
-    "SamplingParams",
+    "TTSContext",
+    "TTSContext",
+    "TTSContext",
     "TextAndVisionContext",
     "TextContext",
-    "TextGenerationResponse",
-    "TextGenerationStatus",
-    "TextResponse",
-    "TokenGenerator",
     "TokenGeneratorContext",
-    "TokenGeneratorRequest",
-    "TokenGeneratorRequestFunction",
-    "TokenGeneratorRequestMessage",
-    "TokenGeneratorRequestTool",
-    "TokenGeneratorResponseFormat",
-    "TTSContext",
+    "msgpack_numpy_decoder",
+    "msgpack_numpy_encoder",
 ]

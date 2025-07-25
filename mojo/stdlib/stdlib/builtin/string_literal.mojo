@@ -19,12 +19,11 @@ from collections.string.format import _CurlyEntryFormattable
 from collections.string.string_slice import CodepointSliceIter, StaticString
 from os import PathLike
 from sys.ffi import c_char
+from collections.string.format import _FormatCurlyEntry
+from collections.string.string_slice import _to_string_list
 
-from memory import Span, UnsafePointer, memcpy
 from python import PythonConvertible, PythonObject
 
-from utils import Writable, Writer
-from utils._visualizers import lldb_formatter_wrapping_type
 
 # ===-----------------------------------------------------------------------===#
 # StringLiteral
@@ -32,20 +31,23 @@ from utils._visualizers import lldb_formatter_wrapping_type
 
 
 @register_passable("trivial")
+@nonmaterializable(String)
 struct StringLiteral[value: __mlir_type.`!kgen.string`](
     Boolable,
-    ExplicitlyCopyable,
-    Writable,
-    IntableRaising,
     Copyable,
+    Defaultable,
+    ExplicitlyCopyable,
+    FloatableRaising,
+    IntableRaising,
     Movable,
+    PathLike,
+    PythonConvertible,
+    PythonConvertible,
     Representable,
     Sized,
     Stringable,
-    FloatableRaising,
-    PathLike,
+    Writable,
     _CurlyEntryFormattable,
-    PythonConvertible,
 ):
     """This type represents a string literal.
 
@@ -81,18 +83,16 @@ struct StringLiteral[value: __mlir_type.`!kgen.string`](
 
     @always_inline("nodebug")
     fn __add__(
-        self,
-        rhs: StringLiteral,
-        out result: StringLiteral[
-            __mlir_attr[
-                `#pop.string_concat<`,
-                self.value,
-                `,`,
-                rhs.value,
-                `> : !kgen.string`,
-            ]
-        ],
-    ):
+        self, rhs: StringLiteral
+    ) -> StringLiteral[
+        __mlir_attr[
+            `#pop.string_concat<`,
+            self.value,
+            `,`,
+            rhs.value,
+            `> : !kgen.string`,
+        ]
+    ]:
         """Concatenate two string literals.
 
         Args:
@@ -101,7 +101,7 @@ struct StringLiteral[value: __mlir_type.`!kgen.string`](
         Returns:
             The concatenated string.
         """
-        result = __type_of(result)()
+        return {}
 
     fn __mul__(self, n: Int) -> String:
         """Concatenates the string `n` times.
@@ -190,7 +190,7 @@ struct StringLiteral[value: __mlir_type.`!kgen.string`](
     # Trait implementations
     # ===-------------------------------------------------------------------===#
 
-    fn to_python_object(owned self) -> PythonObject:
+    fn to_python_object(var self) raises -> PythonObject:
         """Convert this value to a PythonObject.
 
         Returns:
@@ -285,7 +285,9 @@ struct StringLiteral[value: __mlir_type.`!kgen.string`](
             self.as_string_slice()
         )
 
-    fn __getitem__[IndexerType: Indexer](self, idx: IndexerType) -> String:
+    fn __getitem__[
+        IndexerType: Indexer
+    ](self, idx: IndexerType) -> StaticString:
         """Gets the character at the specified position.
 
         Parameters:
@@ -295,9 +297,9 @@ struct StringLiteral[value: __mlir_type.`!kgen.string`](
             idx: The index value.
 
         Returns:
-            A new string containing the character at the specified position.
+            A StringSlice view containing the character at the specified position.
         """
-        return String(self)[idx]
+        return StaticString(ptr=self.unsafe_ptr() + idx, length=1)
 
     # TODO(MSTDL-1327): Reduce pain when string literals can't be
     # non-materializable by making them merge into StaticString.  They should
@@ -627,3 +629,128 @@ struct StringLiteral[value: __mlir_type.`!kgen.string`](
             A copy of the string with no leading whitespaces.
         """
         return String(String(self).lstrip())
+
+    fn format[*Ts: _CurlyEntryFormattable](self, *args: *Ts) raises -> String:
+        """Produce a formatted string using the current string as a template.
+
+        The template, or "format string" can contain literal text and/or
+        replacement fields delimited with curly braces (`{}`). Returns a copy of
+        the format string with the replacement fields replaced with string
+        representations of the `args` arguments.
+
+        For more information, see the discussion in the
+        [`format` module](/mojo/stdlib/collections/string/format/).
+
+        Args:
+            args: The substitution values.
+
+        Parameters:
+            Ts: The types of substitution values that implement `Representable`
+                and `Stringable` (to be changed and made more flexible).
+
+        Returns:
+            The template with the given values substituted.
+
+        Example:
+
+        ```mojo
+        # Manual indexing:
+        print("{0} {1} {0}".format("Mojo", 1.125)) # Mojo 1.125 Mojo
+        # Automatic indexing:
+        print("{} {}".format(True, "hello world")) # True hello world
+        ```
+        """
+        return _FormatCurlyEntry.format(self, args)
+
+    fn join[*Ts: Writable](self, *elems: *Ts) -> String:
+        """Joins string elements using the current string as a delimiter.
+
+        Parameters:
+            Ts: The types of the elements.
+
+        Args:
+            elems: The input values.
+
+        Returns:
+            The joined string.
+        """
+        return String(elems, sep=self)
+
+    fn join[
+        T: Copyable & Movable & Writable
+    ](self, elems: List[T, *_]) -> String:
+        """Joins string elements using the current string as a delimiter.
+        Defaults to writing to the stack if total bytes of `elems` is less than
+        `buffer_size`, otherwise will allocate once to the heap and write
+        directly into that. The `buffer_size` defaults to 4096 bytes to match
+        the default page size on arm64 and x86-64.
+
+        Parameters:
+            T: The type of the elements. Must implement the `Copyable`,
+                `Movable` and `Writable` traits.
+
+        Args:
+            elems: The input values.
+
+        Returns:
+            The joined string.
+        """
+        # Materialize self
+        var result = self
+        return result.join(elems)
+
+    fn split(self, sep: StringSlice, maxsplit: Int = -1) -> List[String]:
+        """Split the string by a separator.
+
+        Args:
+            sep: The string to split on.
+            maxsplit: The maximum amount of items to split from String.
+                Defaults to unlimited.
+
+        Returns:
+            A List of Strings containing the input split by the separator.
+
+        Examples:
+
+        ```mojo
+        # Splitting a space
+        _ = "hello world".split(" ") # ["hello", "world"]
+        # Splitting adjacent separators
+        _ = "hello,,world".split(",") # ["hello", "", "world"]
+        # Splitting with maxsplit
+        _ = "1,2,3".split(",", 1) # ['1', '2,3']
+        # Splitting with an empty separator
+        _ = "123".split("") # ["", "1", "2", "3", ""]
+        ```
+        """
+        return _to_string_list(
+            self.as_string_slice().split(sep, maxsplit=maxsplit)
+        )
+
+    fn split(self, sep: NoneType = None, maxsplit: Int = -1) -> List[String]:
+        """Split the string by every Whitespace separator.
+
+        Args:
+            sep: None.
+            maxsplit: The maximum amount of items to split from String. Defaults
+                to unlimited.
+
+        Returns:
+            A List of Strings containing the input split by the separator.
+
+        Examples:
+
+        ```mojo
+        # Splitting an empty string or filled with whitespaces
+        _ = "      ".split() # []
+        _ = "".split() # []
+
+        # Splitting a string with leading, trailing, and middle whitespaces
+        _ = "      hello    world     ".split() # ["hello", "world"]
+        # Splitting adjacent universal newlines:
+        _ = "hello \\t\\n\\v\\f\\r\\x1c\\x1d\\x1e\\x85\\u2028\\u2029world".split()  # ["hello", "world"]
+        ```
+        """
+        return _to_string_list(
+            self.as_string_slice().split(sep, maxsplit=maxsplit)
+        )

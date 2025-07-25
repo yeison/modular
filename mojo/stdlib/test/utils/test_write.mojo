@@ -10,7 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo -debug-level full %s
 
 from testing import assert_equal
 
@@ -24,7 +23,7 @@ from utils.write import (
 
 
 @fieldwise_init
-struct Point(Writable, Stringable):
+struct Point(Stringable, Writable):
     var x: Int
     var y: Int
 

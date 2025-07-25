@@ -13,12 +13,11 @@
 
 from collections import List
 
-from ._c.ffi import MLIR_func
 from .ir import Context, DialectType, Type
 
 
-@value
-struct FunctionType(DialectType):
+@fieldwise_init
+struct FunctionType(Copyable, DialectType, Movable):
     var ctx: Context
     var inputs: List[Type]
     var results: List[Type]
@@ -39,9 +38,9 @@ struct FunctionType(DialectType):
         return _c.BuiltinTypes.mlirFunctionTypeGet(
             self.ctx.c,
             len(self.inputs),
-            self.inputs.data.bitcast[Type.cType](),
+            self.inputs.unsafe_ptr().bitcast[Type.cType](),
             len(self.results),
-            self.results.data.bitcast[Type.cType](),
+            self.results.unsafe_ptr().bitcast[Type.cType](),
         )
 
     @staticmethod

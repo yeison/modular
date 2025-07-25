@@ -133,6 +133,7 @@ class FetchContinuousBatchingKVCacheCollection:
         return ContinuousBatchingKVCacheCollection(
             ops.custom(
                 "mo.kv_collection_ctor.continuous_batching",
+                device=blocks.device,
                 values=[
                     blocks,
                     cache_lengths,
@@ -215,10 +216,7 @@ class ContinuousBatchingKVCacheManager(KVCacheManager):
         **kwargs: Any,
     ) -> int:
         cache_size_per_sequence = (
-            reduce(
-                mul,
-                cls._block_shape(params, 1, max_seq_len, num_layers),
-            )
+            reduce(mul, cls._block_shape(params, 1, max_seq_len, num_layers))
             * params.dtype.size_in_bytes
         )
         return int(available_cache_memory // cache_size_per_sequence)
@@ -251,16 +249,20 @@ class ContinuousBatchingKVCacheManager(KVCacheManager):
         active_batch_size = len(batch)
 
         # Lookup table and seq_ids are redundant identical tensors.
-        lookup_table_tensor = Tensor.from_numpy(
-            np.array([ctx.cache_seq_id for ctx in batch], np.uint32)
-        )
+        lookup_table_values = []
         cache_lengths_np = np.zeros(active_batch_size, np.uint32)
 
         max_seq_length = 0
         max_context_length = 0
 
         for i, ctx in enumerate(batch):
-            seq_id = ctx.cache_seq_id
+            if not self.contains(ctx.request_id):
+                raise ValueError(
+                    f"request_id: {ctx.request_id} not currently in cache."
+                )
+
+            seq_id = self.request_to_seq_id[ctx.request_id]
+            lookup_table_values.append(seq_id)
             prompt = ctx.next_tokens
             if seq_id > self.max_batch_size:
                 msg = (
@@ -269,8 +271,6 @@ class ContinuousBatchingKVCacheManager(KVCacheManager):
                     " config."
                 )
                 raise ValueError(msg)
-            elif seq_id not in self.active:
-                raise ValueError(f"seq_id: {seq_id} not currently in cache.")
 
             cache_len = ctx.start_idx
 
@@ -292,6 +292,9 @@ class ContinuousBatchingKVCacheManager(KVCacheManager):
         cache_lengths = [
             Tensor.from_numpy(cache_lengths_np).to(d) for d in self.devices
         ]
+        lookup_table_tensor = Tensor.from_numpy(
+            np.array(lookup_table_values, np.uint32)
+        )
         lookup_table_tensor_list = [
             lookup_table_tensor.to(self.devices[i])
             for i in range(len(self.devices))
@@ -330,10 +333,7 @@ class ContinuousBatchingKVCacheManager(KVCacheManager):
             sequences, key/value split, layers, sequence length, attention heads, and head dimension
         """
         return self._block_shape(
-            self.params,
-            n_sequences,
-            self.max_seq_len,
-            self.num_layers,
+            self.params, n_sequences, self.max_seq_len, self.num_layers
         )
 
     @staticmethod

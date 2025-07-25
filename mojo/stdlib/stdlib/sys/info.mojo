@@ -23,9 +23,8 @@ print(CompilationTarget.is_x86())
 
 from collections.string.string_slice import _get_kgen_string
 
-from memory import UnsafePointer
 
-from .ffi import OpaquePointer, _external_call_const, external_call
+from .ffi import _external_call_const, external_call
 
 alias _TargetType = __mlir_type.`!kgen.target`
 
@@ -45,6 +44,48 @@ struct CompilationTarget[value: _TargetType = _current_target()]:
     Parameters:
         value: The target architecture to query. Defaults to the current target.
     """
+
+    @always_inline("nodebug")
+    @staticmethod
+    fn unsupported_target_error[
+        result: AnyType = NoneType._mlir_type,
+        *,
+        operation: Optional[String] = None,
+        note: Optional[String] = None,
+    ]() -> result:
+        """Produces a constraint failure when called indicating that some
+        operation is not supported by the current compilation target.
+
+        Parameters:
+            result: The never-returned result type of this function.
+            operation: Optional name of the operation that is not supported.
+                Should be a function name or short description.
+            note: Optional additional note to print.
+
+        Returns:
+            This function does not return normally, however a return type
+            can be specified to satisfy Mojo type checking.
+        """
+
+        alias note_text = " Note: " + note.value() if note else ""
+
+        @parameter
+        if operation:
+            constrained[
+                False,
+                "Current compilation target does not support operation: "
+                + operation.value()
+                + "."
+                + note_text,
+            ]()
+        else:
+            constrained[
+                False,
+                "Current compilation target does not support this operation."
+                + note_text,
+            ]()
+
+        return os.abort[result]()
 
     @always_inline("nodebug")
     @staticmethod
@@ -73,6 +114,139 @@ struct CompilationTarget[value: _TargetType = _current_target()]:
             True if the target supports SSE4, False otherwise.
         """
         return Self._has_feature["sse4"]()
+
+    @staticmethod
+    fn has_avx() -> Bool:
+        """Returns True if the host system has AVX, otherwise returns False.
+
+        Returns:
+            True if the host system has AVX, otherwise returns False.
+        """
+        return Self._has_feature["avx"]()
+
+    @staticmethod
+    fn has_avx2() -> Bool:
+        """Returns True if the host system has AVX2, otherwise returns False.
+
+        Returns:
+            True if the host system has AVX2, otherwise returns False.
+        """
+        return Self._has_feature["avx2"]()
+
+    @staticmethod
+    fn has_avx512f() -> Bool:
+        """Returns True if the host system has AVX512, otherwise returns False.
+
+        Returns:
+            True if the host system has AVX512, otherwise returns False.
+        """
+        return Self._has_feature["avx512f"]()
+
+    # Platforms
+
+    @staticmethod
+    fn has_fma() -> Bool:
+        """Returns True if the target has FMA (Fused Multiply-Add) support,
+        otherwise returns False.
+
+        Returns:
+            True if the target has FMA support, otherwise returns False.
+        """
+        return Self._has_feature["fma"]()
+
+    @staticmethod
+    fn has_vnni() -> Bool:
+        """Returns True if the target has avx512_vnni, otherwise returns False.
+
+        Returns:
+            True if the target has avx512_vnni, otherwise returns False.
+        """
+        return (
+            Self._has_feature["avx512vnni"]() or Self._has_feature["avxvnni"]()
+        )
+
+    @staticmethod
+    fn has_neon() -> Bool:
+        """Returns True if the target has Neon support, otherwise returns
+        False.
+
+        Returns:
+            True if the target support the Neon instruction set.
+        """
+        alias neon_flag: Bool = Self._has_feature["neon"]()
+
+        @parameter
+        if neon_flag:
+            return True
+        # For Apple Silicon, we need to check the architecture differently
+        return (
+            __mlir_attr[
+                `#kgen.param.expr<eq,`,
+                __mlir_attr[
+                    `#kgen.param.expr<target_get_field,`,
+                    Self.value,
+                    `, "arch" : !kgen.string`,
+                    `> : !kgen.string`,
+                ],
+                `, "apple-m1" : !kgen.string`,
+                `> : i1`,
+            ]
+            or __mlir_attr[
+                `#kgen.param.expr<eq,`,
+                __mlir_attr[
+                    `#kgen.param.expr<target_get_field,`,
+                    Self.value,
+                    `, "arch" : !kgen.string`,
+                    `> : !kgen.string`,
+                ],
+                `, "apple-m2" : !kgen.string`,
+                `> : i1`,
+            ]
+            or __mlir_attr[
+                `#kgen.param.expr<eq,`,
+                __mlir_attr[
+                    `#kgen.param.expr<target_get_field,`,
+                    Self.value,
+                    `, "arch" : !kgen.string`,
+                    `> : !kgen.string`,
+                ],
+                `, "apple-m3" : !kgen.string`,
+                `> : i1`,
+            ]
+            or __mlir_attr[
+                `#kgen.param.expr<eq,`,
+                __mlir_attr[
+                    `#kgen.param.expr<target_get_field,`,
+                    Self.value,
+                    `, "arch" : !kgen.string`,
+                    `> : !kgen.string`,
+                ],
+                `, "apple-m4" : !kgen.string`,
+                `> : i1`,
+            ]
+        )
+
+    @staticmethod
+    fn has_neon_int8_dotprod() -> Bool:
+        """Returns True if the target has the Neon int8 dot product extension,
+        otherwise returns False.
+
+        Returns:
+            True if the target support the Neon int8 dot product extension and
+            False otherwise.
+        """
+        return Self.has_neon() and Self._has_feature["dotprod"]()
+
+    @staticmethod
+    fn has_neon_int8_matmul() -> Bool:
+        """Returns True if the target has the Neon int8 matrix multiplication
+        extension (I8MM), otherwise returns False.
+
+        Returns:
+            True if the target support the Neon int8 matrix multiplication
+            extension (I8MM) and False otherwise.
+        """
+        return Self.has_neon() and Self._has_feature["i8mm"]()
 
     # Platforms
 
@@ -113,173 +287,6 @@ fn _current_arch_kgen() -> __mlir_type.`!kgen.string`:
 @always_inline("nodebug")
 fn _current_arch() -> StaticString:
     return _current_arch_kgen()
-
-
-@always_inline("nodebug")
-@deprecated("Use `CompilationTarget.is_x86()` instead.")
-fn is_x86() -> Bool:
-    """Returns True if the host system architecture is X86 and False otherwise.
-
-    Returns:
-        True if the host system architecture is X86 and False otherwise.
-    """
-    return CompilationTarget.has_sse4()
-
-
-@always_inline("nodebug")
-@deprecated("Use `CompilationTarget.has_sse4()` instead.")
-fn has_sse4() -> Bool:
-    """Returns True if the host system has sse4, otherwise returns False.
-
-    Returns:
-        True if the host system has sse4, otherwise returns False.
-    """
-    return CompilationTarget.has_sse4()
-
-
-@always_inline("nodebug")
-fn has_avx() -> Bool:
-    """Returns True if the host system has AVX, otherwise returns False.
-
-    Returns:
-        True if the host system has AVX, otherwise returns False.
-    """
-    return __mlir_attr[
-        `#kgen.param.expr<target_has_feature,`,
-        _current_target(),
-        `, "avx" : !kgen.string`,
-        `> : i1`,
-    ]
-
-
-@always_inline("nodebug")
-fn has_avx2() -> Bool:
-    """Returns True if the host system has AVX2, otherwise returns False.
-
-    Returns:
-        True if the host system has AVX2, otherwise returns False.
-    """
-    return __mlir_attr[
-        `#kgen.param.expr<target_has_feature,`,
-        _current_target(),
-        `, "avx2" : !kgen.string`,
-        `> : i1`,
-    ]
-
-
-@always_inline("nodebug")
-fn has_avx512f() -> Bool:
-    """Returns True if the host system has AVX512, otherwise returns False.
-
-    Returns:
-        True if the host system has AVX512, otherwise returns False.
-    """
-    return __mlir_attr[
-        `#kgen.param.expr<target_has_feature,`,
-        _current_target(),
-        `, "avx512f" : !kgen.string`,
-        `> : i1`,
-    ]
-
-
-@always_inline("nodebug")
-fn has_fma() -> Bool:
-    """Returns True if the host system has FMA (Fused Multiply-Add) support,
-    otherwise returns False.
-
-    Returns:
-        True if the host system has FMA support, otherwise returns False.
-    """
-    return __mlir_attr[
-        `#kgen.param.expr<target_has_feature,`,
-        _current_target(),
-        `, "fma" : !kgen.string`,
-        `> : i1`,
-    ]
-
-
-@always_inline("nodebug")
-fn has_vnni() -> Bool:
-    """Returns True if the host system has avx512_vnni, otherwise returns False.
-
-    Returns:
-        True if the host system has avx512_vnni, otherwise returns False.
-    """
-    return (
-        __mlir_attr[
-            `#kgen.param.expr<target_has_feature,`,
-            _current_target(),
-            `, "avx512vnni" : !kgen.string`,
-            `> : i1`,
-        ]
-        or __mlir_attr[
-            `#kgen.param.expr<target_has_feature,`,
-            _current_target(),
-            `, "avxvnni" : !kgen.string`,
-            `> : i1`,
-        ]
-    )
-
-
-@always_inline("nodebug")
-fn has_neon() -> Bool:
-    """Returns True if the host system has Neon support, otherwise returns
-    False.
-
-    Returns:
-        True if the host system support the Neon instruction set.
-    """
-    alias neon_flag: Bool = __mlir_attr[
-        `#kgen.param.expr<target_has_feature,`,
-        _current_target(),
-        `, "neon" : !kgen.string`,
-        `> : i1`,
-    ]
-
-    @parameter
-    if neon_flag:
-        return True
-    return is_apple_silicon()
-
-
-@always_inline("nodebug")
-fn has_neon_int8_dotprod() -> Bool:
-    """Returns True if the host system has the Neon int8 dot product extension,
-    otherwise returns False.
-
-    Returns:
-        True if the host system support the Neon int8 dot product extension and
-        False otherwise.
-    """
-    return (
-        has_neon()
-        and __mlir_attr[
-            `#kgen.param.expr<target_has_feature,`,
-            _current_target(),
-            `, "dotprod" : !kgen.string`,
-            `> : i1`,
-        ]
-    )
-
-
-@always_inline("nodebug")
-fn has_neon_int8_matmul() -> Bool:
-    """Returns True if the host system has the Neon int8 matrix multiplication
-    extension (I8MM), otherwise returns False.
-
-    Returns:
-        True if the host system support the Neon int8 matrix multiplication
-        extension (I8MM) and False otherwise.
-    """
-    return (
-        has_neon()
-        and __mlir_attr[
-            `#kgen.param.expr<target_has_feature,`,
-            _current_target(),
-            `, "i8mm" : !kgen.string`,
-            `> : i1`,
-        ]
-    )
 
 
 @always_inline("nodebug")
@@ -576,6 +583,69 @@ fn is_nvidia_gpu[subarch: StaticString]() -> Bool:
 
 
 @always_inline("nodebug")
+fn _is_amd_rdna3() -> Bool:
+    return (
+        is_amd_gpu["amdgpu:gfx1100"]()
+        or is_amd_gpu["amdgpu:gfx1101"]()
+        or is_amd_gpu["amdgpu:gfx1102"]()
+        or is_amd_gpu["amdgpu:gfx1103"]()
+        # These last two are technically RDNA3.5, but we'll treat them as RDNA3
+        # for now.
+        or is_amd_gpu["amdgpu:gfx1150"]()
+        or is_amd_gpu["amdgpu:gfx1151"]()
+    )
+
+
+@always_inline("nodebug")
+fn _is_amd_rdna4() -> Bool:
+    return is_amd_gpu["amdgpu:gfx1200"]() or is_amd_gpu["amdgpu:gfx1201"]()
+
+
+@always_inline("nodebug")
+fn _is_amd_rdna() -> Bool:
+    return _is_amd_rdna3() or _is_amd_rdna4()
+
+
+@always_inline("nodebug")
+fn _is_amd_mi300x() -> Bool:
+    return is_amd_gpu["amdgpu:gfx942"]()
+
+
+@always_inline("nodebug")
+fn _is_amd_mi355x() -> Bool:
+    return is_amd_gpu["amdgpu:gfx950"]()
+
+
+@always_inline("nodebug")
+fn _cnda_version() -> Int:
+    constrained[
+        _is_amd_mi300x() or _is_amd_mi355x(),
+        "querying the cdna version is only supported on AMD hardware",
+    ]()
+
+    @parameter
+    if _is_amd_mi300x():
+        return 3
+    else:
+        return 4
+
+
+@always_inline("nodebug")
+fn _cnda_3_or_newer() -> Bool:
+    return _cnda_version() >= 3
+
+
+@always_inline("nodebug")
+fn _cnda_4_or_newer() -> Bool:
+    return _cnda_version() >= 4
+
+
+@always_inline("nodebug")
+fn _is_amd_cdna() -> Bool:
+    return _is_amd_mi300x() or _is_amd_mi355x()
+
+
+@always_inline("nodebug")
 fn is_amd_gpu() -> Bool:
     """Returns True if the target triple of the compiler is `amdgcn-amd-amdhsa`
     False otherwise.
@@ -584,6 +654,17 @@ fn is_amd_gpu() -> Bool:
         True if the triple target is amdgpu and False otherwise.
     """
     return is_triple["amdgcn-amd-amdhsa"]()
+
+
+@always_inline("nodebug")
+fn is_amd_gpu[subarch: StaticString]() -> Bool:
+    """Returns True if the target triple of the compiler is `amdgcn-amd-amdhsa`
+    and we are compiling for the specified sub-architecture, False otherwise.
+
+    Returns:
+        True if the triple target is amdgpu and False otherwise.
+    """
+    return is_amd_gpu() and _accelerator_arch() == subarch
 
 
 @always_inline("nodebug")

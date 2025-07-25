@@ -19,16 +19,14 @@ from memory import Pointer
 ```
 """
 
-from sys import is_nvidia_gpu
 
 # ===-----------------------------------------------------------------------===#
 # AddressSpace
 # ===-----------------------------------------------------------------------===#
 
 
-@value
 @register_passable("trivial")
-struct _GPUAddressSpace(EqualityComparable):
+struct _GPUAddressSpace(Copyable, EqualityComparable, Movable):
     var _value: Int
 
     # See https://docs.nvidia.com/cuda/nvvm-ir-spec/#address-space
@@ -157,14 +155,9 @@ struct _GPUAddressSpace(EqualityComparable):
         return self.value() != other.value()
 
 
-@value
 @register_passable("trivial")
 struct AddressSpace(
-    EqualityComparable,
-    Stringable,
-    Writable,
-    Copyable,
-    Movable,
+    Copyable, EqualityComparable, Intable, Movable, Stringable, Writable
 ):
     """Address space of the pointer."""
 
@@ -297,14 +290,13 @@ struct AddressSpace(
 # ===-----------------------------------------------------------------------===#
 
 
-@value
 @register_passable("trivial")
 struct Pointer[
     mut: Bool, //,
     type: AnyType,
     origin: Origin[mut],
     address_space: AddressSpace = AddressSpace.GENERIC,
-](ExplicitlyCopyable, Stringable, Copyable, Movable):
+](Copyable, ExplicitlyCopyable, Movable, Stringable):
     """Defines a non-nullable safe pointer.
 
     For a comparison with other pointer types, see [Intro to
@@ -328,11 +320,10 @@ struct Pointer[
         `>`,
     ]
     alias _with_origin = Pointer[type, _, address_space]
-    alias _immutable_cast = ImmutableOrigin.cast_from[_]
 
-    alias Mutable = Self._with_origin[MutableOrigin.cast_from[origin].result]
+    alias Mutable = Self._with_origin[MutableOrigin.cast_from[origin]]
     """The mutable version of the `Pointer`."""
-    alias Immutable = Self._with_origin[Self._immutable_cast[origin].result]
+    alias Immutable = Self._with_origin[ImmutableOrigin.cast_from[origin]]
     """The immutable version of the `Pointer`."""
     # Fields
     var _value: Self._mlir_type
@@ -347,7 +338,7 @@ struct Pointer[
     @always_inline("nodebug")
     fn __init__(
         other: Self._with_origin[_],
-        out self: Self._with_origin[Self._immutable_cast[other.origin].result],
+        out self: Self._with_origin[ImmutableOrigin.cast_from[other.origin]],
     ):
         """Implicitly cast the mutable origin of self to an immutable one.
 

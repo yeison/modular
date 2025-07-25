@@ -10,7 +10,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo-no-debug %s | FileCheck %s
 
 from algorithm import vectorize
 from buffer import NDBuffer
@@ -118,7 +117,7 @@ fn test_vectorize_unroll():
 fn test_vectorize_size_param():
     print("== test_vectorize_size_param")
 
-    # remainder elements are corectly printed
+    # remainder elements are correctly printed
     @parameter
     fn printer[els: Int](n: Int):
         print(els, n)

@@ -10,29 +10,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-# RUN: %mojo-no-debug %s
-
-from collections.string import StaticString
 
 from compile import compile_info
 from gpu import *
 from gpu.host import *
 from gpu.memory import AddressSpace
-from memory import UnsafePointer, stack_allocation
+from memory import stack_allocation
 from testing import *
 
 
 def test_compile_llvm():
     @parameter
     fn my_add_function[
-        type: DType, size: Int
-    ](x: SIMD[type, size], y: SIMD[type, size]) -> SIMD[type, size]:
+        dtype: DType, size: Int
+    ](x: SIMD[dtype, size], y: SIMD[dtype, size]) -> SIMD[dtype, size]:
         return x + y
 
     alias func = my_add_function[DType.float32, 4]
-    var asm = compile_info[func, emission_kind="llvm"]()
-
-    assert_true("fadd" in asm)
+    assert_true("fadd" in compile_info[func, emission_kind="llvm"]())
 
 
 alias target_short_ptr = __mlir_attr[

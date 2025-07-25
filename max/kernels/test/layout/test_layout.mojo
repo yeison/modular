@@ -20,7 +20,6 @@ from layout.layout import (
     coalesce,
     complement,
     composition,
-    cosize,
     expand_modes_alike,
     format_layout,
     is_row_major,
@@ -34,7 +33,7 @@ from layout.layout import (
     upcast,
     zipped_divide,
 )
-from testing import assert_equal, assert_not_equal
+from testing import assert_equal
 from utils import IndexList
 
 
@@ -583,7 +582,7 @@ def test_sublayout():
     )
 
 
-# CEHCK-LABEL: test_crd2idx
+# CHECK-LABEL: test_crd2idx
 def test_crd2idx():
     print("== test_crd2idx")
     alias l_4x4_row_major = Layout.row_major(4, 4)
@@ -608,7 +607,7 @@ def test_crd2idx():
         print(i, l_4x4_row_major.idx2crd(i), l_4x4_col_major.idx2crd(i))
 
 
-# CEHCK-LABEL: test_expand_modes_alike
+# CHECK-LABEL: test_expand_modes_alike
 def test_expand_modes_alike():
     print("== test_expand_modes_alike")
     alias layout_0 = Layout(

@@ -62,7 +62,7 @@ but assigned an integer value, so the  value is implicitly converted to a
 You can create a variable with just a name and a value. For example:
 
 ```mojo
-name = String("Sam")
+name = "Sam"
 user_id = 0
 ```
 
@@ -93,7 +93,7 @@ explicitly- and implicitly-declared variables.
 You can declare a variable with the `var` keyword. For example:
 
 ```mojo
-var name = String("Sam")
+var name = "Sam"
 var user_id: Int
 ```
 
@@ -136,9 +136,10 @@ two ways:
 ```mojo
 var name1: String = "Sam"
 var name2 = String("Sam")
+var name3 = "Sam"
 ```
 
-Both of these lines invoke the same constructor to create a `String` from a
+All of these lines invoke the same constructor to create a `String` from a
 `StringLiteral`.
 
 ### Late initialization
@@ -313,7 +314,7 @@ Some APIs return
 [references](/mojo/manual/values/lifetimes#working-with-references) to values
 owned elsewhere. References can be useful to avoid copying values. For example,
 when you retrieve a value from a collection, the collection returns a reference.
-Assigning a reference to an variable creates a copy:
+Assigning a reference to a variable creates a copy:
 
 ```mojo
 items = [99, 77, 33, 12]

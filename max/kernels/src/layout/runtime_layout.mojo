@@ -22,15 +22,12 @@ from layout.runtime_layout import RuntimeLayout, make_layout
 ```
 """
 
-from sys import bitwidthof
 
 from utils import IndexList
 
 from . import IntTuple, Layout
 from .int_tuple import UNKNOWN_VALUE, flatten
 from .layout import coalesce as coalesce_layout
-from .layout import composition as composition_layout
-from .layout import is_tuple
 from .layout import make_layout as make_layout_static
 from .runtime_tuple import (
     RuntimeTuple,
@@ -51,7 +48,7 @@ struct RuntimeLayout[
     *,
     element_type: DType = DType.int64,
     linear_idx_type: DType = DType.int64,
-](Stringable, Writable):
+](Defaultable, Stringable, Writable):
     """A runtime-configurable layout that uses `RuntimeTuple` for storage.
 
     This struct provides a layout implementation that can be modified at runtime,
@@ -68,14 +65,16 @@ struct RuntimeLayout[
     actual shape and stride values can be modified during execution.
     """
 
-    var shape: RuntimeTuple[layout.shape, element_type=element_type]
+    alias ShapeType = RuntimeTuple[layout.shape, element_type=element_type]
+    var shape: Self.ShapeType
     """The shape of the layout as a runtime tuple.
 
     Stores the size of each dimension. Uses the specified bitwidth and is
     unsigned. Must match the static layout's shape dimensions.
     """
 
-    var stride: RuntimeTuple[layout.stride, element_type=linear_idx_type]
+    alias StrideType = RuntimeTuple[layout.stride, element_type=linear_idx_type]
+    var stride: Self.StrideType
     """The stride of the layout as a runtime tuple.
 
     Stores the stride (step size) for each dimension. Uses 64-bit unsigned
@@ -100,8 +99,8 @@ struct RuntimeLayout[
             layout.all_dims_known(), "Static layout with known dims is required"
         ]()
 
-        self.shape = __type_of(self.shape)()
-        self.stride = __type_of(self.stride)()
+        self.shape = {}
+        self.stride = {}
 
     @always_inline
     fn __init__(
@@ -258,17 +257,6 @@ struct RuntimeLayout[
             A `RuntimeLayout` with row-major stride ordering.
         """
 
-        constrained[
-            shape.element_type == element_type,
-            String(
-                "Element type mismatch, shape has element type",
-                shape.element_type,
-                "but layout has element type",
-                element_type,
-                sep=" ",
-            ),
-        ]()
-
         var stride = IndexList[rank, element_type=linear_idx_type]()
         var c_stride = 1
         stride[rank - 1] = c_stride
@@ -278,7 +266,7 @@ struct RuntimeLayout[
             var dim = shape[i + 1]
             stride[i] = dim * c_stride
             c_stride *= dim
-        return __type_of(result)(shape, stride)
+        return __type_of(result)(shape.cast[element_type](), stride)
 
     @staticmethod
     fn col_major[
@@ -306,17 +294,6 @@ struct RuntimeLayout[
             A `RuntimeLayout` with column-major stride ordering.
         """
 
-        constrained[
-            shape.element_type == element_type,
-            String(
-                "Element type mismatch, shape has element type",
-                shape.element_type,
-                "but layout has element type",
-                element_type,
-                sep=" ",
-            ),
-        ]()
-
         var stride = IndexList[rank, element_type=linear_idx_type]()
         var c_stride = 1
         stride[0] = c_stride
@@ -326,7 +303,7 @@ struct RuntimeLayout[
             var dim = shape[i - 1]
             stride[i] = dim * c_stride
             c_stride *= dim
-        return __type_of(result)(shape, stride)
+        return __type_of(result)(shape.cast[element_type](), stride)
 
     @no_inline
     fn write_to[W: Writer](self, mut writer: W):
